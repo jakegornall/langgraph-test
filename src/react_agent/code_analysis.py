@@ -13,6 +13,7 @@ import json
 import time
 import logging
 from functools import lru_cache
+import hashlib
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
@@ -183,15 +184,57 @@ class CodeAnalyzer:
         return app_name, area_name, controller_name, action
     
     def _clone_repo(self, repo_url: str, target_dir: str) -> str:
-        """Clone the git repository to the target directory."""
-        print(f"Cloning repository: {repo_url}")
+        """
+        Clone the git repository to the target directory if it doesn't already exist.
+        If the repo was already cloned previously, reuse the existing directory.
+        """
+        # Create a consistent directory name based on the repo URL
+        repo_name = repo_url.split('/')[-1].replace('.git', '')
+        repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:8]
+        repo_dir = os.path.join(target_dir, f"{repo_name}_{repo_hash}")
+        
+        # Check if the directory already exists and is a valid git repo
+        if os.path.exists(repo_dir):
+            logger.info(f"Repository directory already exists: {repo_dir}")
+            
+            # Check if it's a valid git repository
+            try:
+                # Try running git status to see if it's a valid repo
+                result = subprocess.run(
+                    ["git", "-C", repo_dir, "status"],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                
+                # If we get here without an exception, it's a valid git repo
+                logger.info("Existing repository is valid. Pulling latest changes...")
+                
+                # Pull the latest changes
+                subprocess.run(
+                    ["git", "-C", repo_dir, "pull"],
+                    check=True,
+                    capture_output=True,
+                    text=True
+                )
+                
+                logger.info("Using existing repository with latest changes")
+                return repo_dir
+                
+            except subprocess.CalledProcessError:
+                logger.warning(f"Existing directory is not a valid git repository. Will clone again.")
+                # Clean up the invalid directory
+                shutil.rmtree(repo_dir, ignore_errors=True)
+        
+        # Clone the repository if we don't have a valid existing one
+        logger.info(f"Cloning repository: {repo_url} to {repo_dir}")
         subprocess.run(
-            ["git", "clone", repo_url, target_dir],
+            ["git", "clone", repo_url, repo_dir],
             check=True,
             capture_output=True,
             text=True
         )
-        return target_dir
+        return repo_dir
     
     def _build_file_tree(self, root_path: str) -> str:
         """Build a string representation of the directory/file tree."""
