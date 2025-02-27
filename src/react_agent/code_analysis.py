@@ -14,9 +14,9 @@ import time
 import logging
 from functools import lru_cache
 
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
 
 # Configure logging
@@ -272,12 +272,10 @@ class CodeAnalyzer:
                 for path, content in file_contents.items()
             ])
             
-            chain = LLMChain(llm=self.llm, prompt=controller_selection_prompt)
-            selected_file = chain.run(
-                controller_name=controller_name,
-                file_list=file_list,
-                file_snippets=file_snippets
-            ).strip()
+            chain = ChatOpenAI(model=self.llm.model)
+            selected_file = chain.invoke(
+                SystemMessage(content=controller_selection_prompt.format(file_list=file_list, file_snippets=file_snippets))
+            ).content.strip()
             
             for path in potential_matches:
                 if str(path) == selected_file:
@@ -317,8 +315,10 @@ class CodeAnalyzer:
             """
         )
         
-        chain = LLMChain(llm=self.llm.with_structured_output(dict), prompt=action_extraction_prompt)
-        result = chain.run(action_name=action_name, file_content=content)
+        message_content = action_extraction_prompt.format(file_content=content)
+        response = self.llm.invoke([HumanMessage(content=message_content)])
+        
+        result = json.loads(response.content)
         
         return result.get("function_code", ""), result
     
@@ -441,11 +441,13 @@ class CodeAnalyzer:
         ])
         
         try:
-            chain = LLMChain(llm=self.llm.with_structured_output(list[str]), prompt=template_identification_prompt)
-            identified_templates = chain.run(
+            prompt_content = template_identification_prompt.format(
                 action_code=action_code,
                 template_previews=formatted_previews
             )
+            
+            structured_llm = self.llm.with_structured_output(list[str])
+            identified_templates = structured_llm.invoke(prompt_content)
             
             # Read full content of identified templates
             result = []
@@ -469,46 +471,68 @@ class CodeAnalyzer:
             return []
     
     def _convert_templates_to_react(self, templates: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Convert Ractive templates to React components using AI."""
+        """Convert BlueJS templates to React components."""
         if not templates:
             return []
             
         react_components = []
         
-        conversion_prompt = PromptTemplate.from_template(
-            """Convert the following Ractive/Handlebars/Mustache template to a modern React functional component.
-            
-            Template name: {template_name}
-            
-            ```html
-            {template_content}
-            ```
-            
-            Guidelines:
-            1. Use modern React practices with hooks
-            2. Convert Ractive directives and syntax to React JSX
-            3. Convert two-way bindings appropriately
-            4. Handle any event handlers and conditional rendering
-            5. For any unknown or complex logic, make reasonable assumptions
-            6. Add explanatory comments for complex transformations
-            
-            Return the React component code only without explanations.
-            """
-        )
-        
         for template in templates:
-            chain = LLMChain(llm=self.llm, prompt=conversion_prompt)
-            react_code = chain.run(
-                template_name=template["name"],
-                template_content=template["content"]
-            )
-            
-            react_components.append({
-                "original_template": template["name"],
-                "path": template["path"],
-                "react_code": react_code
-            })
-            
+            try:
+                # Create a prompt to convert the template
+                conversion_prompt = PromptTemplate.from_template(
+                    """Convert this BlueJS template to a React component with Material-UI:
+                    
+                    Template name: {name}
+                    Template path: {path}
+                    
+                    ```html
+                    {content}
+                    ```
+                    
+                    Please convert this to a modern React component:
+                    1. Use functional components with hooks
+                    2. Use Material-UI for styling and components
+                    3. Handle any mustache/handlebars expressions properly
+                    4. Convert BlueJS specific patterns to React patterns
+                    5. Ensure proper prop handling
+                    
+                    Return just the React component code without any explanations.
+                    """
+                )
+                
+                message_content = conversion_prompt.format(
+                    name=template["name"],
+                    path=template["path"],
+                    content=template["content"]
+                )
+                
+                # Generate the React component
+                response = self.llm.invoke([HumanMessage(content=message_content)])
+                
+                # Extract code from response
+                react_code = response.content
+                
+                # Remove markdown code block markers if present
+                react_code = re.sub(r'^```(?:jsx|javascript|react)?\s*', '', react_code, flags=re.MULTILINE)
+                react_code = re.sub(r'\s*```$', '', react_code, flags=re.MULTILINE)
+                
+                # Save the converted component
+                component_name = os.path.splitext(template["name"])[0]
+                if not component_name[0].isupper():
+                    component_name = component_name.title().replace('-', '').replace('_', '')
+                
+                react_components.append({
+                    "original_template": template["name"],
+                    "component_name": component_name,
+                    "filename": f"{component_name}.jsx",
+                    "content": react_code
+                })
+                
+            except Exception as e:
+                logger.error(f"Error converting template {template['name']}: {str(e)}")
+                continue
+                
         return react_components
     
     def _parse_config_files(self, repo_path: str) -> None:
@@ -712,8 +736,9 @@ class CodeAnalyzer:
         ])
         
         try:
-            chain = LLMChain(llm=self.llm.with_structured_output(dict[str, str]), prompt=alias_extraction_prompt)
-            alias_result = chain.run(config_files=config_files_text)
+            prompt_content = alias_extraction_prompt.format(config_files=config_files_text)
+            structured_llm = self.llm.with_structured_output(dict[str, str])
+            alias_result = structured_llm.invoke(prompt_content)
             
             # Process and add the aliases
             for alias, path in alias_result.items():
@@ -731,7 +756,7 @@ class CodeAnalyzer:
                     absolute_path = os.path.join(repo_path, path)
                     
                 self.alias_map[alias] = absolute_path
-            
+                
         except Exception as e:
             logger.error(f"Error in AI alias extraction: {str(e)}")
 
@@ -842,8 +867,10 @@ class CodeAnalyzer:
             """
         )
         
-        chain = LLMChain(llm=self.llm, prompt=analysis_prompt)
-        analysis = chain.run(file_path=str(file_path), content=content)
+        message_content = analysis_prompt.format(file_path=str(file_path), content=content)
+        response = self.llm.invoke([HumanMessage(content=message_content)])
+        
+        analysis = response.content
         
         # Save analysis to memory
         self.memory.save_context(
@@ -899,12 +926,14 @@ class CodeAnalyzer:
                     for dep, info in resolved_dependencies.items()
                 ])
                 
-                chain = LLMChain(llm=self.llm.with_structured_output(list[str]), prompt=prioritization_prompt)
-                prioritized_deps = chain.run(
+                json_content = prioritization_prompt.format(
                     file_path=str(file_path),
                     file_analysis=analysis,
                     dependencies=dep_formatted
                 )
+                
+                structured_llm = self.llm.with_structured_output(list[str])
+                prioritized_deps = structured_llm.invoke(json_content)
                 
                 # Analyze prioritized dependencies
                 for dep in prioritized_deps:
@@ -1095,8 +1124,7 @@ class CodeAnalyzer:
             for c in config_files
         ]) if config_files else "No path aliases found."
         
-        chain = LLMChain(llm=self.llm, prompt=requirements_prompt)
-        requirements = chain.run(
+        message_content = requirements_prompt.format(
             file_tree=file_tree,
             controller_file=str(controller_file),
             controller_content=controller_content,
@@ -1106,6 +1134,8 @@ class CodeAnalyzer:
             template_info=template_info,
             config_info=config_info
         )
+        
+        requirements = self.llm.invoke([HumanMessage(content=message_content)]).content
         
         return {
             "full_requirements": requirements
