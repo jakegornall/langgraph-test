@@ -245,66 +245,85 @@ class CodeAnalyzer:
         return "\n".join(result)
     
     def _find_controller_file(self, repo_path: str, controller_name: str) -> Optional[Path]:
-        """Find the controller file matching the controller name."""
-        # Add .js extension if not present
-        if not controller_name.endswith('.js'):
-            controller_name_with_ext = f"{controller_name}.js" 
-        else:
-            controller_name_with_ext = controller_name
-            controller_name = controller_name[:-3]  # Remove .js
-            
-        # Look for exact matches first
-        for root, _, files in os.walk(repo_path):
-            for file in files:
-                if file == controller_name_with_ext:
-                    return Path(os.path.join(root, file))
+        """
+        Find the controller file in the repository based on the controller name.
         
-        # Try to find files with controller in the name
-        potential_matches = []
-        for root, _, files in os.walk(repo_path):
+        Args:
+            repo_path: Path to the repository root
+            controller_name: Name of the controller to find
+            
+        Returns:
+            Path to the controller file or None if not found
+        """
+        logger.info(f"Looking for controller file with name: {controller_name}")
+        
+        # Common test patterns to exclude
+        test_patterns = [
+            "/test/", "/tests/", "/spec/", "/__tests__/", "/mocks/", "/__mocks__/",
+            "/fixtures/", "/__fixtures__/", "/stubs/", "/__stubs__/",
+            ".test.", ".spec.", ".mock.", ".stub.", ".fixture."
+        ]
+        
+        # Common controller name patterns
+        controller_patterns = [
+            f"{controller_name}.js",
+            f"{controller_name}Controller.js",
+            f"{controller_name}_controller.js",
+            f"{controller_name}-controller.js"
+        ]
+        
+        # Look for the controller file in the repository
+        for root, dirs, files in os.walk(repo_path):
+            # Skip hidden directories and test directories
+            dirs[:] = [d for d in dirs if not d.startswith('.') and 
+                      not d in ['test', 'tests', 'spec', '__tests__', 'mocks', '__mocks__',
+                               'fixtures', '__fixtures__', 'stubs', '__stubs__']]
+            
+            for file in files:
+                # Skip files that don't match the controller pattern
+                if not any(file.lower() == pattern.lower() for pattern in controller_patterns):
+                    continue
+                    
+                file_path = os.path.join(root, file)
+                relative_path = os.path.relpath(file_path, repo_path)
+                
+                # Skip test files based on path patterns
+                if any(test_pattern in relative_path.lower() for test_pattern in test_patterns):
+                    logger.debug(f"Skipping test file: {relative_path}")
+                    continue
+                
+                logger.info(f"Found controller file: {file_path}")
+                return Path(file_path)
+        
+        # If not found with exact name, look for files that might contain the controller name
+        logger.info(f"Controller file not found with exact name, searching for partial matches...")
+        
+        # Expanded search for controller-like files
+        for root, dirs, files in os.walk(repo_path):
+            # Skip hidden directories and test directories
+            dirs[:] = [d for d in dirs if not d.startswith('.') and 
+                      not d in ['test', 'tests', 'spec', '__tests__', 'mocks', '__mocks__',
+                               'fixtures', '__fixtures__', 'stubs', '__stubs__']]
+            
             for file in files:
                 if file.endswith('.js') and controller_name.lower() in file.lower():
-                    potential_matches.append(Path(os.path.join(root, file)))
+                    file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, repo_path)
                     
-        # If we have exactly one match, return it
-        if len(potential_matches) == 1:
-            return potential_matches[0]
-            
-        # Otherwise, use AI to determine the most likely controller file
-        if potential_matches:
-            file_contents = {}
-            for path in potential_matches[:5]:  # Limit to avoid processing too many files
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                    file_contents[str(path)] = f.read()
-            
-            controller_selection_prompt = PromptTemplate.from_template(
-                """You are analyzing a BlueJS repository. Based on the file contents provided, 
-                determine which file is most likely to be the controller named '{controller_name}'.
-                
-                The potential controller files are:
-                {file_list}
-                
-                For each file, here's the beginning of its content:
-                {file_snippets}
-                
-                Return only the full path of the most likely controller file with no additional text.
-                """
-            )
-            
-            file_list = "\n".join([f"- {p}" for p in file_contents.keys()])
-            file_snippets = "\n\n".join([
-                f"FILE: {path}\n{content[:500]}..." 
-                for path, content in file_contents.items()
-            ])
-            
-            selected_file = self.llm.invoke(
-                SystemMessage(content=controller_selection_prompt.format(file_list=file_list, file_snippets=file_snippets))
-            ).content.strip()
-            
-            for path in potential_matches:
-                if str(path) == selected_file:
-                    return path
-                
+                    # Skip test files based on path patterns
+                    if any(test_pattern in relative_path.lower() for test_pattern in test_patterns):
+                        logger.debug(f"Skipping test file: {relative_path}")
+                        continue
+                    
+                    # Confirm this looks like a controller by checking file contents
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        # Check if file has controller-like patterns
+                        if 'define(' in content and ('function(' in content or '=>' in content):
+                            logger.info(f"Found potential controller file: {file_path}")
+                            return Path(file_path)
+        
+        logger.warning(f"Could not find controller file for {controller_name}")
         return None
     
     def _find_action_function(self, controller_file: Path, action_name: str) -> Tuple[str, Dict[str, Any]]:
