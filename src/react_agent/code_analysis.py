@@ -16,7 +16,7 @@ from functools import lru_cache
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
+from react_agent.ChaseAzureOpenAI import getModel
 from langchain.memory import ConversationBufferMemory
 
 # Configure logging
@@ -28,7 +28,7 @@ class CodeAnalyzer:
     
     def __init__(self, model_name: str = "gpt-4o", timeout_minutes: int = 30):
         """Initialize with the specified LLM model."""
-        self.llm = ChatOpenAI(model=model_name)
+        self.llm = getModel()
         # Add memory to track the conversation with the LLM
         self.memory = ConversationBufferMemory(return_messages=True)
         # Track visited files to avoid circular dependencies
@@ -272,8 +272,7 @@ class CodeAnalyzer:
                 for path, content in file_contents.items()
             ])
             
-            chain = ChatOpenAI(model=self.llm.model)
-            selected_file = chain.invoke(
+            selected_file = self.llm.invoke(
                 SystemMessage(content=controller_selection_prompt.format(file_list=file_list, file_snippets=file_snippets))
             ).content.strip()
             
@@ -1158,9 +1157,24 @@ def analyze_blueJS_repo(repo_url: str, screen_id: str) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Example usage
-    repo_url = "https://github.com/your-repo/bluejs-app.git"
-    screen_id = "app-name/area-name/controller-name/action-name"
+    # Import dotenv for loading environment variables
+    from dotenv import load_dotenv
+    import os
+    import sys
+    
+    # Load environment variables from .env file
+    load_dotenv()
+    
+    # Get repo_url and screen_id from environment variables
+    repo_url = os.getenv("REPO_URL")
+    screen_id = os.getenv("SCREEN_ID")
+    
+    # Validate that we have the required environment variables
+    if not repo_url or not screen_id:
+        print("Error: REPO_URL and SCREEN_ID must be set in .env file")
+        sys.exit(1)
+    
+    # Run the analysis
     result = analyze_blueJS_repo(repo_url, screen_id)
     print(result)
 
