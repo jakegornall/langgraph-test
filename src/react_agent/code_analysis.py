@@ -24,6 +24,9 @@ from langchain.memory import ConversationBufferMemory
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Define a dedicated location for storing repositories
+REPO_STORAGE_DIR = os.path.join(os.path.expanduser("~"), ".react_agent", "repositories")
+
 class CodeAnalyzer:
     """Analyzes BlueJS code repositories to extract requirements and convert to React."""
     
@@ -83,93 +86,72 @@ class CodeAnalyzer:
             
         logger.info(f"Parsed screen ID: App={app_name}, Area={area_name}, Controller={controller_name}, Action={action}")
         
-        # Create temporary directory for the repo
-        temp_dir = tempfile.mkdtemp()
-        try:
-            # Clone the repository
-            repo_path = self._clone_repo(repo_url, temp_dir)
+        # Ensure the repository storage directory exists
+        os.makedirs(REPO_STORAGE_DIR, exist_ok=True)
+        
+        # Clone the repository to our dedicated storage location
+        repo_path = self._clone_repo(repo_url, REPO_STORAGE_DIR)
+        
+        # Generate file tree
+        file_tree = self._build_file_tree(repo_path)
+        logger.info("Generated file tree structure")
+        
+        # Find and parse configuration files for path aliases
+        self._parse_config_files(repo_path)
+        logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
+        
+        # Find controller file
+        controller_file = self._find_controller_file(repo_path, controller_name)
+        if not controller_file:
+            raise ValueError(f"Could not find controller file for {controller_name}")
             
-            # Generate file tree
-            file_tree = self._build_file_tree(repo_path)
-            logger.info("Generated file tree structure")
-            
-            # Find and parse configuration files for path aliases
-            self._parse_config_files(repo_path)
-            logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
-            
-            # Find controller file
-            controller_file = self._find_controller_file(repo_path, controller_name)
-            if not controller_file:
-                raise ValueError(f"Could not find controller file for {controller_name}")
+        logger.info(f"Found controller file: {controller_file}")
+        
+        # Analyze the controller file and its dependencies
+        controller_analysis = self._analyze_file_dependencies(controller_file, repo_path)
+        
+        # Find action function in controller
+        action_code, action_details = self._find_action_function(controller_file, action)
+        if not action_code:
+            raise ValueError(f"Could not find action '{action}' in controller {controller_file}")
                 
-            logger.info(f"Found controller file: {controller_file}")
+        logger.info(f"Found action function: {action}")
+        
+        # Find templates used by this action and related files
+        templates = self._find_templates(repo_path, action_code, controller_file, action_details)
+        logger.info(f"Found {len(templates)} templates")
+        
+        # Convert templates to React components
+        react_components = self._convert_templates_to_react(templates)
+        
+        # Analyze code to generate requirements with dependency context
+        requirements = self._generate_requirements_with_context(
+            repo_path, 
+            controller_file, 
+            action_code, 
+            file_tree, 
+            templates,
+            controller_analysis
+        )
+        
+        elapsed_time = time.time() - self.start_time
+        logger.info(f"Analysis completed in {elapsed_time:.2f} seconds")
+        
+        return {
+            "screen_id": screen_id,
+            "file_tree": file_tree,
+            "controller_file": str(controller_file),
+            "action_function": action,
+            "action_code": action_code,
+            "action_details": action_details,
+            "templates": templates,
+            "react_components": react_components,
+            "requirements": requirements,
+            "dependencies": self.dependency_graph,
+            "path_aliases": self.alias_map,
+            "analysis_time_seconds": elapsed_time
+        }
             
-            # Analyze the controller file and its dependencies
-            controller_analysis = self._analyze_file_dependencies(controller_file, repo_path)
-            
-            # Find action function in controller
-            action_code, action_details = self._find_action_function(controller_file, action)
-            if not action_code:
-                raise ValueError(f"Could not find action '{action}' in controller {controller_file}")
-                
-            logger.info(f"Found action function: {action}")
-            
-            # Find templates used by this action and related files
-            templates = self._find_templates(repo_path, action_code, controller_file, action_details)
-            logger.info(f"Found {len(templates)} templates")
-            
-            # Convert templates to React components
-            react_components = self._convert_templates_to_react(templates)
-            
-            # Analyze code to generate requirements with dependency context
-            requirements = self._generate_requirements_with_context(
-                repo_path, 
-                controller_file, 
-                action_code, 
-                file_tree, 
-                templates,
-                controller_analysis
-            )
-            
-            elapsed_time = time.time() - self.start_time
-            logger.info(f"Analysis completed in {elapsed_time:.2f} seconds")
-            
-            return {
-                "screen_id": screen_id,
-                "file_tree": file_tree,
-                "controller_file": str(controller_file),
-                "action_function": action,
-                "action_code": action_code,
-                "action_details": action_details,
-                "templates": templates,
-                "react_components": react_components,
-                "requirements": requirements,
-                "dependencies": self.dependency_graph,
-                "path_aliases": self.alias_map,
-                "analysis_time_seconds": elapsed_time
-            }
-            
-        except TimeoutError as e:
-            logger.error(f"Analysis timed out: {str(e)}")
-            # Return partial results if available
-            return {
-                "error": "Analysis timed out",
-                "partial_results": {
-                    "screen_id": screen_id,
-                    "dependencies": self.dependency_graph,
-                    "path_aliases": self.alias_map,
-                }
-            }
-        except Exception as e:
-            logger.error(f"Error during analysis: {str(e)}", exc_info=True)
-            raise
-        finally:
-            # Clean up
-            try:
-                shutil.rmtree(temp_dir)
-            except Exception as e:
-                logger.warning(f"Error cleaning up temporary directory: {str(e)}")
-    
     def _parse_screen_id(self, screen_id: str) -> Tuple[str, str, str, str]:
         """Parse the screen ID into its components."""
         parts = screen_id.split('/')
@@ -1200,7 +1182,7 @@ def analyze_blueJS_repo(repo_url: str, screen_id: str) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Import dotenv for loading environment variables
+    # Import required modules for the main function
     from dotenv import load_dotenv
     import os
     import sys
