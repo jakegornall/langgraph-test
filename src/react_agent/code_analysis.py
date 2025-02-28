@@ -247,6 +247,7 @@ class CodeAnalyzer:
     def _find_controller_file(self, repo_path: str, controller_name: str) -> Optional[Path]:
         """
         Find the controller file in the repository based on the controller name.
+        Prioritizes directories named 'controller' or 'controllers'.
         
         Args:
             repo_path: Path to the repository root
@@ -272,10 +273,67 @@ class CodeAnalyzer:
             f"{controller_name}-controller.js"
         ]
         
-        # Look for the controller file in the repository
+        # First, prioritize searching in directories named 'controller' or 'controllers'
+        priority_dirs = []
+        
+        # Find all directories named 'controller' or 'controllers' (case insensitive)
+        for root, dirs, _ in os.walk(repo_path):
+            for d in dirs:
+                if d.lower() in ['controller', 'controllers']:
+                    priority_dirs.append(os.path.join(root, d))
+        
+        logger.info(f"Found {len(priority_dirs)} priority controller directories")
+        
+        # Search first in the priority directories
+        for priority_dir in priority_dirs:
+            for root, dirs, files in os.walk(priority_dir):
+                # Skip hidden directories and test directories
+                dirs[:] = [d for d in dirs if not d.startswith('.') and 
+                          not d in ['test', 'tests', 'spec', '__tests__', 'mocks', '__mocks__',
+                                   'fixtures', '__fixtures__', 'stubs', '__stubs__']]
+                
+                for file in files:
+                    # Check for exact controller name patterns first
+                    if any(file.lower() == pattern.lower() for pattern in controller_patterns):
+                        file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(file_path, repo_path)
+                        
+                        # Skip test files based on path patterns
+                        if any(test_pattern in relative_path.lower() for test_pattern in test_patterns):
+                            logger.debug(f"Skipping test file: {relative_path}")
+                            continue
+                        
+                        logger.info(f"Found controller file in priority directory: {file_path}")
+                        return Path(file_path)
+                    
+                    # Also check for files containing the controller name
+                    if file.endswith('.js') and controller_name.lower() in file.lower():
+                        file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(file_path, repo_path)
+                        
+                        # Skip test files
+                        if any(test_pattern in relative_path.lower() for test_pattern in test_patterns):
+                            continue
+                        
+                        # Confirm this looks like a controller by checking file contents
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                                # Check if file has controller-like patterns
+                                if 'define(' in content and ('function(' in content or '=>' in content):
+                                    logger.info(f"Found potential controller file in priority directory: {file_path}")
+                                    return Path(file_path)
+                        except Exception as e:
+                            logger.warning(f"Error reading file {file_path}: {str(e)}")
+        
+        # If not found in priority directories, perform the regular search
+        logger.info("Controller not found in priority directories, searching elsewhere...")
+        
+        # Look for the controller file in the rest of the repository
         for root, dirs, files in os.walk(repo_path):
-            # Skip hidden directories and test directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and 
+            # Skip priority directories that we've already searched
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in priority_dirs and 
+                      not d.startswith('.') and 
                       not d in ['test', 'tests', 'spec', '__tests__', 'mocks', '__mocks__',
                                'fixtures', '__fixtures__', 'stubs', '__stubs__']]
             
@@ -295,13 +353,14 @@ class CodeAnalyzer:
                 logger.info(f"Found controller file: {file_path}")
                 return Path(file_path)
         
-        # If not found with exact name, look for files that might contain the controller name
+        # If still not found, look for files that might contain the controller name anywhere
         logger.info(f"Controller file not found with exact name, searching for partial matches...")
         
         # Expanded search for controller-like files
         for root, dirs, files in os.walk(repo_path):
-            # Skip hidden directories and test directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and 
+            # Skip priority directories that we've already searched
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in priority_dirs and 
+                      not d.startswith('.') and 
                       not d in ['test', 'tests', 'spec', '__tests__', 'mocks', '__mocks__',
                                'fixtures', '__fixtures__', 'stubs', '__stubs__']]
             
@@ -316,12 +375,31 @@ class CodeAnalyzer:
                         continue
                     
                     # Confirm this looks like a controller by checking file contents
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        # Check if file has controller-like patterns
-                        if 'define(' in content and ('function(' in content or '=>' in content):
-                            logger.info(f"Found potential controller file: {file_path}")
-                            return Path(file_path)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            # Check if file has controller-like patterns
+                            if 'define(' in content and ('function(' in content or '=>' in content):
+                                logger.info(f"Found potential controller file: {file_path}")
+                                return Path(file_path)
+                    except Exception as e:
+                        logger.warning(f"Error reading file {file_path}: {str(e)}")
+        
+        # Also try checking app or area structure patterns (e.g., app_name/area_name/controller_name.js)
+        app_name, area_name, _, _ = self._parse_screen_id(controller_name)
+        if app_name and area_name:
+            logger.info(f"Trying app/area pattern for {app_name}/{area_name}/{controller_name}")
+            pattern_paths = [
+                os.path.join(repo_path, app_name, area_name, f"{controller_name}.js"),
+                os.path.join(repo_path, app_name, area_name, "controllers", f"{controller_name}.js"),
+                os.path.join(repo_path, "app", app_name, area_name, f"{controller_name}.js"),
+                os.path.join(repo_path, "app", app_name, area_name, "controllers", f"{controller_name}.js"),
+            ]
+            
+            for path in pattern_paths:
+                if os.path.exists(path) and not any(p in path.lower() for p in test_patterns):
+                    logger.info(f"Found controller file using app/area pattern: {path}")
+                    return Path(path)
         
         logger.warning(f"Could not find controller file for {controller_name}")
         return None
