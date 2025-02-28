@@ -319,7 +319,7 @@ class CodeAnalyzer:
     def _find_controller_file_with_llm(self, repo_path: str, screen_id: str) -> Optional[Path]:
         """
         Use LLM to find the controller file in the repository based on the screen ID.
-        Uses structured output for more reliable parsing.
+        Uses structured output and interactive directory navigation for more efficient exploration.
         
         Args:
             repo_path: Path to the repository root
@@ -329,71 +329,97 @@ class CodeAnalyzer:
             Path to the controller file or None if not found
         """
         from pydantic import BaseModel, Field
-        from typing import List, Optional as OptionalType
+        from typing import List, Optional as OptionalType, Union, Literal
 
-        class FileReadRequest(BaseModel):
+        class NavigateDirectory(BaseModel):
+            """Request to navigate to a directory."""
+            command: Literal["cd"] = Field("cd", description="Command to change directory")
+            path: str = Field(description="Path to navigate to, relative to current directory or absolute from repo root")
+
+        class ListDirectory(BaseModel):
+            """Request to list contents of a directory."""
+            command: Literal["ls"] = Field("ls", description="Command to list directory contents")
+            path: OptionalType[str] = Field(None, description="Optional path to list, defaults to current directory")
+
+        class ReadFile(BaseModel):
             """Request to read a file."""
-            file_path: str = Field(description="Path to the file to read, relative to repo root")
+            command: Literal["read"] = Field("read", description="Command to read file contents")
+            path: str = Field(description="Path to the file to read, relative to current directory or absolute from repo root")
             reason: str = Field(description="Reason for reading this file")
 
-        class ControllerFileResult(BaseModel):
-            """Result of controller file search."""
-            found: bool = Field(description="Whether the controller file was found")
-            file_path: OptionalType[str] = Field(None, description="Path to the controller file, relative to repo root")
+        class FindController(BaseModel):
+            """Declaration that controller file has been found."""
+            command: Literal["found"] = Field("found", description="Command to indicate controller file has been found")
+            path: str = Field(description="Path to the controller file, relative to repo root")
             confidence: int = Field(description="Confidence level (1-10) that this is the right controller file")
             reasoning: str = Field(description="Explanation of why this is believed to be the controller file")
-            read_file: OptionalType[FileReadRequest] = Field(None, description="Request to read a specific file")
+
+        class SearchAction(BaseModel):
+            """Next action in the search process."""
+            action: Union[NavigateDirectory, ListDirectory, ReadFile, FindController] = Field(
+                description="The next action to take in the search process"
+            )
         
         logger.info(f"Using LLM to find controller file for screen ID: {screen_id}")
         
         # Parse the screen ID
         app_name, area_name, controller_name, action = self._parse_screen_id(screen_id)
         
-        # Generate file tree for the repo
-        file_tree = self._build_file_tree(repo_path)
-        
-        # Set up the initial prompt for the LLM
-        prompt = f"""You are helping to find a controller file in a BlueJS repository.
-
-REPOSITORY STRUCTURE:
-```
-{file_tree}
-```
-
-SCREEN ID:
-{screen_id}
-
-The screen ID follows the format "<app>/<area>/<controller>/<action>" where:
-- app: The application name
-- area: The area or section of the application
-- controller: The name of the controller (usually matches the file name without extension)
-- action: The name of the action function within the controller (e.g., "index", "show", "update")
-
-For this screen ID:
-- App: {app_name}
-- Area: {area_name}
-- Controller: {controller_name}
-- Action: {action if action else "index"}
-
-WHAT A CONTROLLER LOOKS LIKE:
-- Often located in a directory named "controllers" or "controller"
-- Usually defined with AMD syntax: define([dependencies], function(dep1, dep2) {{ ... }})
-- May have action functions that match the action in the screen ID
-- Action functions might be called "index", "show", "edit", etc.
-- Functions may receive a "context" parameter which has properties like routeHistory, privateState, state
-- May be in app/{app_name}/{area_name}/controllers/{controller_name}.js
-- Could be in various other locations based on the app's organization
-
-Your task is to find the controller file that matches this screen ID.
-
-If you need to read a file, respond with a request to read it. If you believe you've found the controller file, respond with the file path and your confidence level.
-"""
-
-        # Function to read file content that we'll use in the conversation
-        def read_file_content(file_path: str) -> str:
-            """Read the content of a file in the repository."""
+        # Function to list directory contents
+        def list_directory(dir_path: str) -> str:
+            """List contents of a directory."""
             try:
-                full_path = os.path.join(repo_path, file_path.lstrip('/'))
+                # Normalize path handling
+                if dir_path.startswith('/'):
+                    full_path = os.path.join(repo_path, dir_path.lstrip('/'))
+                else:
+                    full_path = os.path.join(current_dir, dir_path)
+                    
+                if not os.path.exists(full_path):
+                    return f"Error: Path '{dir_path}' does not exist"
+                if not os.path.isdir(full_path):
+                    return f"Error: Path '{dir_path}' is not a directory"
+                    
+                # Get directory contents
+                entries = sorted(os.listdir(full_path))
+                
+                # Organize into dirs and files
+                dirs = []
+                files = []
+                for entry in entries:
+                    entry_path = os.path.join(full_path, entry)
+                    # Skip hidden files/dirs
+                    if entry.startswith('.'):
+                        continue
+                    # Skip large dirs like node_modules
+                    if os.path.isdir(entry_path) and entry in ['node_modules', 'dist', 'build', 'coverage']:
+                        continue
+                    
+                    if os.path.isdir(entry_path):
+                        dirs.append(f"{entry}/")
+                    else:
+                        files.append(entry)
+                
+                # Format listing with dirs first, then files
+                return "Directories:\n" + "\n".join(dirs) + "\n\nFiles:\n" + "\n".join(files)
+            except Exception as e:
+                return f"Error listing directory: {str(e)}"
+
+        # Function to read file content
+        def read_file_content(file_path: str) -> str:
+            """Read the content of a file."""
+            try:
+                # Normalize path handling
+                if file_path.startswith('/'):
+                    full_path = os.path.join(repo_path, file_path.lstrip('/'))
+                else:
+                    full_path = os.path.join(current_dir, file_path)
+                    
+                if not os.path.exists(full_path):
+                    return f"Error: File '{file_path}' does not exist"
+                if not os.path.isfile(full_path):
+                    return f"Error: Path '{file_path}' is not a file"
+                    
                 with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
                 if len(content) > 10000:
@@ -402,51 +428,131 @@ If you need to read a file, respond with a request to read it. If you believe yo
             except Exception as e:
                 return f"Error reading file: {str(e)}"
 
+        # Track current directory (starts at repo root)
+        current_dir = repo_path
+        relative_current_dir = "/"
+        
         # Configure the LLM for structured output
-        structured_llm = self.llm.with_structured_output(ControllerFileResult)
+        structured_llm = self.llm.with_structured_output(SearchAction)
+        
+        # Set up the initial prompt for the LLM
+        initial_prompt = f"""You are helping to find a controller file in a BlueJS repository.
+
+You'll navigate the repository like a file system explorer using these commands:
+- cd <path>: Change to directory (use absolute paths starting with / or relative paths)
+- ls [path]: List contents of current directory or specified path
+- read <path>: Read contents of a file
+- found <path>: Declare you've found the controller file
+
+SCREEN ID:
+{screen_id}
+
+The screen ID follows the format "<app>/<area>/<controller>/<action>" where:
+- app: The application name ({app_name})
+- area: The area or section of the application ({area_name})
+- controller: The name of the controller ({controller_name})
+- action: The name of the action function within the controller ({action if action else "index"})
+
+WHAT A CONTROLLER FILE LOOKS LIKE:
+- Often located in a directory named "controllers" or "controller"
+- Usually defined with AMD syntax: define([dependencies], function(dep1, dep2) {{ ... }})
+- May have action functions that match the action in the screen ID
+- Action functions might be called "index", "show", "edit", etc.
+- Functions may receive a "context" parameter which has properties like routeHistory, privateState, state
+- May be in app/{app_name}/{area_name}/controllers/{controller_name}.js
+- Could be in various other locations based on the app's organization
+
+Current directory: {relative_current_dir}
+Let's start by looking at the contents of the repository root.
+"""
+
+        # Initial directory listing
+        initial_listing = list_directory(".")
         
         # Set up the conversation with a maximum number of exchanges
-        max_attempts = 10
-        conversation = [{"role": "user", "content": prompt}]
+        max_attempts = 15
+        conversation = [
+            {"role": "user", "content": initial_prompt},
+            {"role": "user", "content": f"Contents of {relative_current_dir}:\n{initial_listing}"}
+        ]
         controller_file_path = None
         
         for attempt in range(max_attempts):
             # Get structured response from LLM
             result = structured_llm.invoke(conversation)
+            action = result.action
             
-            # If the LLM wants to read a file
-            if result.read_file is not None:
-                file_path = result.read_file.file_path
-                logger.info(f"LLM requested to read file: {file_path} - Reason: {result.read_file.reason}")
+            # Handle directory navigation
+            if isinstance(action, NavigateDirectory):
+                path = action.path
+                logger.info(f"LLM navigating to directory: {path}")
                 
-                # Read the content and add it to the conversation
-                file_content = read_file_content(file_path)
-                file_response = f"Here is the content of {file_path}:\n\n```javascript\n{file_content}\n```"
-                conversation.append({"role": "assistant", "content": f"I need to read {file_path}: {result.read_file.reason}"})
-                conversation.append({"role": "user", "content": file_response})
+                # Handle absolute vs relative paths
+                if path.startswith('/'):
+                    new_dir = os.path.join(repo_path, path.lstrip('/'))
+                    new_relative_dir = path
+                else:
+                    new_dir = os.path.normpath(os.path.join(current_dir, path))
+                    new_relative_dir = os.path.normpath(os.path.join(relative_current_dir, path))
+                    if not new_relative_dir.startswith('/'):
+                        new_relative_dir = '/' + new_relative_dir
+                
+                # Verify the directory exists
+                if os.path.exists(new_dir) and os.path.isdir(new_dir):
+                    current_dir = new_dir
+                    relative_current_dir = new_relative_dir
+                    directory_listing = list_directory(".")
+                    
+                    response = f"Changed directory to {relative_current_dir}\nContents:\n{directory_listing}"
+                    conversation.append({"role": "assistant", "content": f"cd {path}"})
+                    conversation.append({"role": "user", "content": response})
+                else:
+                    response = f"Error: Directory '{path}' does not exist"
+                    conversation.append({"role": "assistant", "content": f"cd {path}"})
+                    conversation.append({"role": "user", "content": response})
             
-            # If the LLM found the controller file
-            elif result.found:
-                file_path = result.file_path
-                logger.info(f"LLM found controller file: {file_path} with confidence {result.confidence}/10")
-                logger.info(f"Reasoning: {result.reasoning}")
+            # Handle directory listing
+            elif isinstance(action, ListDirectory):
+                path = action.path if action.path else "."
+                logger.info(f"LLM listing directory: {path}")
+                
+                directory_listing = list_directory(path)
+                
+                response = f"Contents of {path}:\n{directory_listing}"
+                conversation.append({"role": "assistant", "content": f"ls {path}"})
+                conversation.append({"role": "user", "content": response})
+            
+            # Handle file reading
+            elif isinstance(action, ReadFile):
+                path = action.path
+                logger.info(f"LLM reading file: {path} - Reason: {action.reason}")
+                
+                file_content = read_file_content(path)
+                
+                response = f"Content of {path}:\n```\n{file_content}\n```"
+                conversation.append({"role": "assistant", "content": f"read {path}: {action.reason}"})
+                conversation.append({"role": "user", "content": response})
+            
+            # Handle controller found declaration
+            elif isinstance(action, FindController):
+                path = action.path
+                logger.info(f"LLM found controller file: {path} with confidence {action.confidence}/10")
+                logger.info(f"Reasoning: {action.reasoning}")
+                
+                # Standardize path handling
+                if not path.startswith('/'):
+                    path = os.path.normpath(os.path.join(relative_current_dir, path))
                 
                 # Verify the file exists
-                full_path = os.path.join(repo_path, file_path.lstrip('/'))
-                if os.path.exists(full_path):
+                full_path = os.path.join(repo_path, path.lstrip('/'))
+                if os.path.exists(full_path) and os.path.isfile(full_path):
                     controller_file_path = Path(full_path)
                     logger.info(f"Verified controller file exists: {controller_file_path}")
                     break
                 else:
-                    logger.warning(f"LLM reported file that doesn't exist: {file_path}")
-                    conversation.append({"role": "assistant", "content": f"I found the controller at {file_path}"})
-                    conversation.append({"role": "user", "content": f"The file {file_path} doesn't exist. Please continue searching."})
-            
-            # If the LLM hasn't found the file yet but didn't request to read anything
-            else:
-                logger.info(f"LLM is still searching, attempt {attempt+1}/{max_attempts}")
-                conversation.append({"role": "assistant", "content": "Still searching for the controller file."})
-                conversation.append({"role": "user", "content": "Please continue your search. You can request to read files or report when you've found the controller."})
+                    logger.warning(f"LLM reported file that doesn't exist: {path}")
+                    conversation.append({"role": "assistant", "content": f"found {path}"})
+                    conversation.append({"role": "user", "content": f"Error: File '{path}' does not exist. Please continue searching."})
         
         if not controller_file_path:
             logger.warning(f"LLM could not find controller file after {max_attempts} attempts")
