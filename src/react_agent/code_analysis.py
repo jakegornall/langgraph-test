@@ -19,6 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from react_agent.ChaseAzureOpenAI import getModel
 from langchain.memory import ConversationBufferMemory
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -100,11 +101,16 @@ class CodeAnalyzer:
         self._parse_config_files(repo_path)
         logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
         
-        # Find controller file
-        controller_file = self._find_controller_file(repo_path, controller_name)
+        # Find controller file using LLM
+        controller_file = self._find_controller_file_with_llm(repo_path, screen_id)
+        if not controller_file:
+            # Fall back to heuristic-based search
+            logger.info("LLM-based controller file search failed, falling back to heuristic search")
+            controller_file = self._find_controller_file(repo_path, controller_name)
+        
         if not controller_file:
             raise ValueError(f"Could not find controller file for {controller_name}")
-            
+        
         logger.info(f"Found controller file: {controller_file}")
         
         # Analyze the controller file and its dependencies
@@ -218,31 +224,234 @@ class CodeAnalyzer:
         )
         return repo_dir
     
-    def _build_file_tree(self, root_path: str) -> str:
-        """Build a string representation of the directory/file tree."""
+    def _build_file_tree(self, repo_path: str, max_depth: int = 6) -> str:
+        """
+        Build a recursive file tree of the repository to help the LLM understand the structure.
+        Limits depth and excludes certain directories to avoid creating an excessively large tree.
+        
+        Args:
+            repo_path: Path to the repository root
+            max_depth: Maximum depth for the tree
+            
+        Returns:
+            String representation of the file tree
+        """
+        logger.info(f"Building file tree for {repo_path}")
+        
+        # Directories to exclude
+        excluded_dirs = {
+            'node_modules', '.git', 'dist', 'build', 'coverage', 
+            'test', 'tests', '__tests__', 'fixtures', '__fixtures__',
+            '__mocks__', '__snapshots__'
+        }
+        
+        # File extensions to include (focus on JavaScript/TypeScript files and configs)
+        included_extensions = {
+            '.js', '.jsx', '.ts', '.tsx', '.json', '.html', '.css', '.scss', '.less',
+            '.config.js', '.config.ts'
+        }
+        
         result = []
         
-        def traverse(path, prefix=""):
-            entries = sorted(os.listdir(path))
-            for i, entry in enumerate(entries):
-                is_last = i == len(entries) - 1
-                entry_path = os.path.join(path, entry)
+        def _build_tree(dir_path, prefix="", depth=0):
+            if depth > max_depth:
+                result.append(f"{prefix}... (max depth reached)")
+                return
+            
+            try:
+                entries = list(os.scandir(dir_path))
+                entries.sort(key=lambda e: (not e.is_dir(), e.name.lower()))
                 
-                # Skip .git directory and other hidden files
-                if entry.startswith('.'):
-                    continue
+                # Count dirs and files for summarization
+                dirs = [e for e in entries if e.is_dir() and not e.name.startswith('.') and e.name.lower() not in excluded_dirs]
+                files = [e for e in entries if e.is_file() and any(e.name.endswith(ext) for ext in included_extensions)]
                 
-                # Add to result
-                connector = "└── " if is_last else "├── "
-                result.append(f"{prefix}{connector}{entry}")
+                # If there are too many entries, summarize
+                if len(dirs) + len(files) > 50 and depth > 2:
+                    result.append(f"{prefix}{os.path.basename(dir_path)}/ ({len(dirs)} directories, {len(files)} files)")
+                    
+                    # List the first 10 directories and 10 files as examples
+                    for i, entry in enumerate(dirs[:10]):
+                        if i == 9 and len(dirs) > 10:
+                            result.append(f"{prefix}    ... ({len(dirs) - 9} more directories)")
+                        else:
+                            _build_tree(entry.path, prefix + "    ", depth + 1)
+                    
+                    for i, entry in enumerate(files[:10]):
+                        if i == 9 and len(files) > 10:
+                            result.append(f"{prefix}    ... ({len(files) - 9} more files)")
+                        else:
+                            result.append(f"{prefix}    {entry.name}")
+                    
+                    return
                 
-                # Recursively process directory
-                if os.path.isdir(entry_path):
-                    next_prefix = prefix + ("    " if is_last else "│   ")
-                    traverse(entry_path, next_prefix)
+                # Process each entry
+                for i, entry in enumerate(entries):
+                    # Check if this is the last entry in the current directory
+                    is_last = (i == len(entries) - 1)
+                    
+                    if entry.is_dir():
+                        # Skip excluded directories
+                        dir_name = entry.name.lower()
+                        if dir_name.startswith('.') or dir_name in excluded_dirs:
+                            continue
+                        
+                        # Process directory
+                        result.append(f"{prefix}{'└── ' if is_last else '├── '}{entry.name}/")
+                        _build_tree(entry.path, prefix + ('    ' if is_last else '│   '), depth + 1)
+                    elif entry.is_file():
+                        # Only include files with specific extensions
+                        if any(entry.name.endswith(ext) for ext in included_extensions):
+                            result.append(f"{prefix}{'└── ' if is_last else '├── '}{entry.name}")
+            
+            except PermissionError:
+                result.append(f"{prefix}[Permission denied]")
+            except Exception as e:
+                result.append(f"{prefix}[Error: {str(e)}]")
         
-        traverse(root_path)
+        # Start building the tree from the repository root
+        repo_name = os.path.basename(repo_path)
+        result.append(f"{repo_name}/")
+        _build_tree(repo_path, "")
+        
         return "\n".join(result)
+    
+    def _find_controller_file_with_llm(self, repo_path: str, screen_id: str) -> Optional[Path]:
+        """
+        Use LLM to find the controller file in the repository based on the screen ID.
+        Uses structured output for more reliable parsing.
+        
+        Args:
+            repo_path: Path to the repository root
+            screen_id: Screen ID in format "<app>/<area>/<controller>/<action>"
+            
+        Returns:
+            Path to the controller file or None if not found
+        """
+        from pydantic import BaseModel, Field
+        from typing import List, Optional as OptionalType
+
+        class FileReadRequest(BaseModel):
+            """Request to read a file."""
+            file_path: str = Field(description="Path to the file to read, relative to repo root")
+            reason: str = Field(description="Reason for reading this file")
+
+        class ControllerFileResult(BaseModel):
+            """Result of controller file search."""
+            found: bool = Field(description="Whether the controller file was found")
+            file_path: OptionalType[str] = Field(None, description="Path to the controller file, relative to repo root")
+            confidence: int = Field(description="Confidence level (1-10) that this is the right controller file")
+            reasoning: str = Field(description="Explanation of why this is believed to be the controller file")
+            read_file: OptionalType[FileReadRequest] = Field(None, description="Request to read a specific file")
+        
+        logger.info(f"Using LLM to find controller file for screen ID: {screen_id}")
+        
+        # Parse the screen ID
+        app_name, area_name, controller_name, action = self._parse_screen_id(screen_id)
+        
+        # Generate file tree for the repo
+        file_tree = self._build_file_tree(repo_path)
+        
+        # Set up the initial prompt for the LLM
+        prompt = f"""You are helping to find a controller file in a BlueJS repository.
+
+REPOSITORY STRUCTURE:
+```
+{file_tree}
+```
+
+SCREEN ID:
+{screen_id}
+
+The screen ID follows the format "<app>/<area>/<controller>/<action>" where:
+- app: The application name
+- area: The area or section of the application
+- controller: The name of the controller (usually matches the file name without extension)
+- action: The name of the action function within the controller (e.g., "index", "show", "update")
+
+For this screen ID:
+- App: {app_name}
+- Area: {area_name}
+- Controller: {controller_name}
+- Action: {action if action else "index"}
+
+WHAT A CONTROLLER LOOKS LIKE:
+- Often located in a directory named "controllers" or "controller"
+- Usually defined with AMD syntax: define([dependencies], function(dep1, dep2) {{ ... }})
+- May have action functions that match the action in the screen ID
+- Action functions might be called "index", "show", "edit", etc.
+- Functions may receive a "context" parameter which has properties like routeHistory, privateState, state
+- May be in app/{app_name}/{area_name}/controllers/{controller_name}.js
+- Could be in various other locations based on the app's organization
+
+Your task is to find the controller file that matches this screen ID.
+
+If you need to read a file, respond with a request to read it. If you believe you've found the controller file, respond with the file path and your confidence level.
+"""
+
+        # Function to read file content that we'll use in the conversation
+        def read_file_content(file_path: str) -> str:
+            """Read the content of a file in the repository."""
+            try:
+                full_path = os.path.join(repo_path, file_path.lstrip('/'))
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                if len(content) > 10000:
+                    content = content[:10000] + "\n... (content truncated, file too large)"
+                return content
+            except Exception as e:
+                return f"Error reading file: {str(e)}"
+
+        # Configure the LLM for structured output
+        structured_llm = self.llm.with_structured_output(ControllerFileResult)
+        
+        # Set up the conversation with a maximum number of exchanges
+        max_attempts = 10
+        conversation = [{"role": "user", "content": prompt}]
+        controller_file_path = None
+        
+        for attempt in range(max_attempts):
+            # Get structured response from LLM
+            result = structured_llm.invoke(conversation)
+            
+            # If the LLM wants to read a file
+            if result.read_file is not None:
+                file_path = result.read_file.file_path
+                logger.info(f"LLM requested to read file: {file_path} - Reason: {result.read_file.reason}")
+                
+                # Read the content and add it to the conversation
+                file_content = read_file_content(file_path)
+                file_response = f"Here is the content of {file_path}:\n\n```javascript\n{file_content}\n```"
+                conversation.append({"role": "assistant", "content": f"I need to read {file_path}: {result.read_file.reason}"})
+                conversation.append({"role": "user", "content": file_response})
+            
+            # If the LLM found the controller file
+            elif result.found:
+                file_path = result.file_path
+                logger.info(f"LLM found controller file: {file_path} with confidence {result.confidence}/10")
+                logger.info(f"Reasoning: {result.reasoning}")
+                
+                # Verify the file exists
+                full_path = os.path.join(repo_path, file_path.lstrip('/'))
+                if os.path.exists(full_path):
+                    controller_file_path = Path(full_path)
+                    logger.info(f"Verified controller file exists: {controller_file_path}")
+                    break
+                else:
+                    logger.warning(f"LLM reported file that doesn't exist: {file_path}")
+                    conversation.append({"role": "assistant", "content": f"I found the controller at {file_path}"})
+                    conversation.append({"role": "user", "content": f"The file {file_path} doesn't exist. Please continue searching."})
+            
+            # If the LLM hasn't found the file yet but didn't request to read anything
+            else:
+                logger.info(f"LLM is still searching, attempt {attempt+1}/{max_attempts}")
+                conversation.append({"role": "assistant", "content": "Still searching for the controller file."})
+                conversation.append({"role": "user", "content": "Please continue your search. You can request to read files or report when you've found the controller."})
+        
+        if not controller_file_path:
+            logger.warning(f"LLM could not find controller file after {max_attempts} attempts")
+        
+        return controller_file_path
     
     def _find_controller_file(self, repo_path: str, controller_name: str) -> Optional[Path]:
         """
