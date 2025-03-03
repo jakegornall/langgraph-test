@@ -419,7 +419,7 @@ Let's start by looking at the contents of the repository root.
                     tool_func = tools_dict[tool_name]
                     try:
                         # Call the tool function with the arguments
-                        tool_result = tool_func(**tool_args)
+                        tool_result = tool_func.invoke(tool_args)
                         
                         # Process find_controller tool result
                         if tool_name == 'find_controller':
