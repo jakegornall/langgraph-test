@@ -3,16 +3,20 @@
 import subprocess
 import sys
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import InjectedToolArg
+from langchain_core.tools import InjectedToolArg, BaseTool, tool
 from typing_extensions import Annotated
 
 from react_agent.configuration import Configuration
 from react_agent.dev_server import DevServer
 from react_agent.models import FileItem, SearchResult, FileContents
 
+# Global variable to track current directory during controller file search
+_current_search_directory = None
+_repo_root_path = None
 
 def search_docs(
     query: str,
@@ -156,8 +160,225 @@ def take_screenshots(
     return _take_screenshots_process(url)
 
 
+def setup_repo_search(repo_path: str) -> None:
+    """Set up repository search by initializing the current directory."""
+    global _current_search_directory, _repo_root_path
+    _repo_root_path = repo_path
+    _current_search_directory = repo_path
+
+
+@tool
+def navigate_directory(path: str) -> str:
+    """
+    Change to a specified directory within the repository.
+    
+    Args:
+        path: Path to navigate to, can be relative to current directory or absolute from repo root
+        
+    Returns:
+        String describing the result of the navigation and contents of the new directory.
+    """
+    global _current_search_directory
+    
+    if not _current_search_directory:
+        return "Error: Repository search has not been initialized."
+    
+    # Handle absolute vs relative paths
+    if path.startswith('/'):
+        new_dir = os.path.join(_repo_root_path, path.lstrip('/'))
+    else:
+        new_dir = os.path.normpath(os.path.join(_current_search_directory, path))
+    
+    # Verify the directory exists
+    if not os.path.exists(new_dir):
+        return f"Error: Directory '{path}' does not exist"
+    if not os.path.isdir(new_dir):
+        return f"Error: Path '{path}' is not a directory"
+    
+    # Update current directory
+    _current_search_directory = new_dir
+    relative_path = os.path.relpath(new_dir, _repo_root_path)
+    if relative_path == '.':
+        relative_path = '/'
+    else:
+        relative_path = '/' + relative_path
+    
+    # Get directory contents
+    dirs, files = [], []
+    for entry in sorted(os.listdir(new_dir)):
+        entry_path = os.path.join(new_dir, entry)
+        # Skip hidden files/dirs
+        if entry.startswith('.'):
+            continue
+        # Skip large dirs like node_modules
+        if os.path.isdir(entry_path) and entry in ['node_modules', 'dist', 'build', 'coverage']:
+            continue
+        
+        if os.path.isdir(entry_path):
+            dirs.append(f"{entry}/")
+        else:
+            files.append(entry)
+    
+    # Format the result
+    result = f"Changed directory to {relative_path}\n\nDirectories:\n"
+    result += "\n".join(dirs) if dirs else "No directories"
+    result += "\n\nFiles:\n"
+    result += "\n".join(files) if files else "No files"
+    
+    return result
+
+
+@tool
+def list_directory(path: Optional[str] = None) -> str:
+    """
+    List contents of a directory.
+    
+    Args:
+        path: Optional path to list. If not provided, lists the current directory.
+        
+    Returns:
+        String representation of directory contents.
+    """
+    global _current_search_directory
+    
+    if not _current_search_directory:
+        return "Error: Repository search has not been initialized."
+    
+    # Determine which directory to list
+    if path:
+        if path.startswith('/'):
+            dir_to_list = os.path.join(_repo_root_path, path.lstrip('/'))
+        else:
+            dir_to_list = os.path.normpath(os.path.join(_current_search_directory, path))
+    else:
+        dir_to_list = _current_search_directory
+        path = os.path.relpath(dir_to_list, _repo_root_path)
+        if path == '.':
+            path = '/'
+        else:
+            path = '/' + path
+    
+    # Verify the directory exists
+    if not os.path.exists(dir_to_list):
+        return f"Error: Directory '{path}' does not exist"
+    if not os.path.isdir(dir_to_list):
+        return f"Error: Path '{path}' is not a directory"
+    
+    # Get directory contents
+    dirs, files = [], []
+    for entry in sorted(os.listdir(dir_to_list)):
+        entry_path = os.path.join(dir_to_list, entry)
+        # Skip hidden files/dirs
+        if entry.startswith('.'):
+            continue
+        # Skip large dirs like node_modules
+        if os.path.isdir(entry_path) and entry in ['node_modules', 'dist', 'build', 'coverage']:
+            continue
+        
+        if os.path.isdir(entry_path):
+            dirs.append(f"{entry}/")
+        else:
+            files.append(entry)
+    
+    # Format the result
+    result = f"Contents of {path}:\n\nDirectories:\n"
+    result += "\n".join(dirs) if dirs else "No directories"
+    result += "\n\nFiles:\n"
+    result += "\n".join(files) if files else "No files"
+    
+    return result
+
+
+@tool
+def read_file(path: str) -> str:
+    """
+    Read the content of a file.
+    
+    Args:
+        path: Path to the file to read, relative to current directory or absolute from repo root
+        
+    Returns:
+        Content of the file or error message.
+    """
+    global _current_search_directory
+    
+    if not _current_search_directory:
+        return "Error: Repository search has not been initialized."
+    
+    # Normalize path handling
+    if path.startswith('/'):
+        full_path = os.path.join(_repo_root_path, path.lstrip('/'))
+    else:
+        full_path = os.path.normpath(os.path.join(_current_search_directory, path))
+    
+    # Verify the file exists
+    if not os.path.exists(full_path):
+        return f"Error: File '{path}' does not exist"
+    if not os.path.isfile(full_path):
+        return f"Error: Path '{path}' is not a file"
+    
+    try:
+        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        if len(content) > 10000:
+            content = content[:10000] + "\n... (content truncated, file too large)"
+        return content
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
+
+
+@tool
+def find_controller(path: str, confidence: int, reasoning: str) -> Dict[str, Any]:
+    """
+    Declare that a controller file has been found.
+    
+    Args:
+        path: Path to the controller file, relative to repo root
+        confidence: Confidence level (1-10) that this is the right controller
+        reasoning: Explanation of why this is believed to be the controller file
+        
+    Returns:
+        Dictionary with result of the declaration.
+    """
+    global _repo_root_path
+    
+    if not _repo_root_path:
+        return {"success": False, "error": "Repository search has not been initialized."}
+    
+    # Standardize path handling
+    if not path.startswith('/'):
+        # Convert to absolute path from repo root
+        path = '/' + path
+    
+    # Verify the file exists
+    full_path = os.path.join(_repo_root_path, path.lstrip('/'))
+    if not os.path.exists(full_path):
+        return {
+            "success": False, 
+            "error": f"File '{path}' does not exist"
+        }
+    
+    if not os.path.isfile(full_path):
+        return {
+            "success": False, 
+            "error": f"Path '{path}' is not a file"
+        }
+    
+    return {
+        "success": True,
+        "file_path": str(Path(full_path)),
+        "confidence": confidence,
+        "reasoning": reasoning
+    }
+
+
+# Include file navigation tools in the TOOLS list
 TOOLS = [
     search_docs,
     compile_component,
-    take_screenshots
+    take_screenshots,
+    navigate_directory,
+    list_directory,
+    read_file,
+    find_controller
 ]
