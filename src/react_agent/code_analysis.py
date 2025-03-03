@@ -387,13 +387,26 @@ IMPORTANT SEARCH STRATEGY:
 2. Look especially for directories named "js", "app", "src", "frontend", or anything related to {app_name} and {area_name}
 3. Always check folders named "controllers", "controller", or any similar variations
 4. Don't just stay at the top level - most repositories have organized code in nested subdirectories
-5. Common patterns to explore:
+5. IMPORTANT: Controllers will NOT be in test/spec folders - skip any test, spec, or __tests__ directories
+6. Common patterns to explore:
    - js/controllers/
    - app/{app_name}/{area_name}/controllers/
    - src/controllers/
    - frontend/controllers/
    - {app_name}/controllers/
    - controllers/{app_name}/
+
+7. Skip these directories as they won't contain controllers:
+   - node_modules/
+   - .git/
+   - test/
+   - tests/
+   - __tests__/
+   - spec/
+   - specs/
+   - e2e/
+   - dist/
+   - build/
 
 Let's start by looking at the contents of the repository root and then systematically explore promising directories.
 """
@@ -405,6 +418,12 @@ Let's start by looking at the contents of the repository root and then systemati
         
         # Track directories we've already explored to avoid repetition
         explored_directories = set(["/"])
+        
+        # Directories to skip (including test directories)
+        skip_directories = {
+            "node_modules", ".git", "test", "tests", "__tests__", 
+            "spec", "specs", "e2e", "dist", "build"
+        }
         
         for attempt in range(max_attempts):
             logger.info(f"LLM search attempt {attempt+1}/{max_attempts}")
@@ -422,13 +441,23 @@ Let's start by looking at the contents of the repository root and then systemati
                     
                     logger.info(f"Tool call: {tool_name} with args: {tool_args}")
                     
-                    # Track directory exploration
+                    # Check if trying to navigate to a test directory
                     if tool_name == 'navigate_directory' and 'path' in tool_args:
                         path = tool_args['path']
+                        path_parts = os.path.normpath(path).split(os.sep)
+                        
+                        # Check if any part of the path is in skip_directories
+                        if any(part in skip_directories for part in path_parts):
+                            hint_message = f"Skipping directory '{path}' as it appears to be a test/build directory which won't contain controllers."
+                            messages.append(HumanMessage(content=hint_message))
+                            continue
+                        
+                        # Check for repeated exploration
                         if path in explored_directories:
                             hint_message = f"You've already explored {path}. Try exploring a different directory or going deeper."
                             messages.append(HumanMessage(content=hint_message))
                             continue
+                        
                         explored_directories.add(path)
                     
                     # Get the tool function
@@ -490,6 +519,8 @@ Look specifically for directories named:
 2. Any app-specific directories matching "{app_name}" or "{area_name}"
 3. Common web app patterns like "js/", "src/", "app/", etc.
 
+Remember to SKIP all test-related directories as they won't contain actual controllers.
+
 Please be thorough and methodical in your search.
 """
                 messages.append(HumanMessage(content=hint_message))
@@ -502,8 +533,8 @@ We're halfway through our search attempts, and we haven't found the controller y
 Let's consider:
 1. Looking for files matching the controller name pattern (with or without .js extension)
 2. Exploring any directories we haven't checked yet, especially those with application-specific names
-3. Checking for any build or compiled directories that might contain the final JS files
-4. Looking for any config files that might give clues about the application structure
+3. Checking for any config files that might give clues about the application structure
+4. Remember that controllers won't be in test or build directories
 
 Don't give up! Controllers can be deeply nested or named in unexpected ways.
 """

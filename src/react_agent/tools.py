@@ -305,6 +305,7 @@ def read_file(path: str) -> str:
     Args:
         path: Path to the file to read, relative to current directory or absolute from repo root.
               Supports '..' to go up one directory level and '.' to reference current directory.
+              Remember that the path is relative to the current directory, not the repository root.
         
     Returns:
         Content of the file or error message.
@@ -346,43 +347,64 @@ def find_controller(path: str, confidence: int, reasoning: str) -> Dict[str, Any
     Declare that a controller file has been found.
     
     Args:
-        path: Path to the controller file, relative to repo root
+        path: Path to the controller file, relative to current directory or absolute from repo root.
+              Supports '..' to go up one directory level and '.' to reference current directory.
         confidence: Confidence level (1-10) that this is the right controller
         reasoning: Explanation of why this is believed to be the controller file
         
     Returns:
         Dictionary with result of the declaration.
     """
-    global _repo_root_path
+    global _current_search_directory, _repo_root_path
     
-    if not _repo_root_path:
+    if not _current_search_directory or not _repo_root_path:
         return {"success": False, "error": "Repository search has not been initialized."}
     
-    # Standardize path handling
-    if not path.startswith('/'):
-        # Convert to absolute path from repo root
-        path = '/' + path
-    
-    # Verify the file exists
-    full_path = os.path.join(_repo_root_path, path.lstrip('/'))
-    if not os.path.exists(full_path):
+    try:
+        # Handle absolute vs relative paths
+        if path.startswith('/'):
+            full_path = os.path.normpath(os.path.join(_repo_root_path, path.lstrip('/')))
+        else:
+            # Handle relative paths (including . and .. navigation)
+            full_path = os.path.normpath(os.path.join(_current_search_directory, path))
+        
+        # Ensure we can't access files outside the repo root
+        if not full_path.startswith(_repo_root_path):
+            return {
+                "success": False, 
+                "error": f"Cannot access files outside the repository root."
+            }
+        
+        # Verify the file exists
+        if not os.path.exists(full_path):
+            return {
+                "success": False, 
+                "error": f"File '{path}' does not exist"
+            }
+        
+        if not os.path.isfile(full_path):
+            return {
+                "success": False, 
+                "error": f"Path '{path}' is not a file"
+            }
+        
+        # Calculate relative path from repo root for display
+        rel_path = os.path.relpath(full_path, _repo_root_path)
+        display_path = '/' + rel_path if rel_path != '.' else '/file'
+        
+        return {
+            "success": True,
+            "file_path": str(Path(full_path)),
+            "display_path": display_path,
+            "confidence": confidence,
+            "reasoning": reasoning
+        }
+        
+    except Exception as e:
         return {
             "success": False, 
-            "error": f"File '{path}' does not exist"
+            "error": f"Error processing controller file path: {str(e)}"
         }
-    
-    if not os.path.isfile(full_path):
-        return {
-            "success": False, 
-            "error": f"Path '{path}' is not a file"
-        }
-    
-    return {
-        "success": True,
-        "file_path": str(Path(full_path)),
-        "confidence": confidence,
-        "reasoning": reasoning
-    }
 
 
 # Include file navigation tools in the TOOLS list
