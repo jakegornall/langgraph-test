@@ -170,123 +170,131 @@ def setup_repo_search(repo_path: str) -> None:
 @tool
 def navigate_directory(path: str) -> str:
     """
-    Change to a specified directory within the repository.
+    Change the current directory.
     
     Args:
-        path: Path to navigate to, can be relative to current directory or absolute from repo root
+        path: Path to navigate to. Can be absolute (starting with '/') or relative to current directory.
+              Supports '..' to go up one directory level and '.' to reference current directory.
         
     Returns:
-        String describing the result of the navigation and contents of the new directory.
+        String confirming the navigation or an error message.
     """
-    global _current_search_directory
+    global _current_search_directory, _repo_root_path
     
     if not _current_search_directory:
         return "Error: Repository search has not been initialized."
     
-    # Handle absolute vs relative paths
-    if path.startswith('/'):
-        new_dir = os.path.join(_repo_root_path, path.lstrip('/'))
-    else:
-        new_dir = os.path.normpath(os.path.join(_current_search_directory, path))
-    
-    # Verify the directory exists
-    if not os.path.exists(new_dir):
-        return f"Error: Directory '{path}' does not exist"
-    if not os.path.isdir(new_dir):
-        return f"Error: Path '{path}' is not a directory"
-    
-    # Update current directory
-    _current_search_directory = new_dir
-    relative_path = os.path.relpath(new_dir, _repo_root_path)
-    if relative_path == '.':
-        relative_path = '/'
-    else:
-        relative_path = '/' + relative_path
-    
-    # Get directory contents
-    dirs, files = [], []
-    for entry in sorted(os.listdir(new_dir)):
-        entry_path = os.path.join(new_dir, entry)
-        # Skip hidden files/dirs
-        if entry.startswith('.'):
-            continue
-        # Skip large dirs like node_modules
-        if os.path.isdir(entry_path) and entry in ['node_modules', 'dist', 'build', 'coverage']:
-            continue
-        
-        if os.path.isdir(entry_path):
-            dirs.append(f"{entry}/")
+    try:
+        # Handle absolute paths (starting with /)
+        if path.startswith('/'):
+            new_abs_path = os.path.normpath(os.path.join(_repo_root_path, path.lstrip('/')))
         else:
-            files.append(entry)
+            # Handle relative paths (including . and .. navigation)
+            new_abs_path = os.path.normpath(os.path.join(_current_search_directory, path))
+        
+        # Ensure we can't navigate outside the repo root
+        if not new_abs_path.startswith(_repo_root_path):
+            return f"Error: Cannot navigate outside the repository root."
+        
+        # Verify the directory exists
+        if not os.path.exists(new_abs_path):
+            return f"Error: Directory '{path}' does not exist"
+        if not os.path.isdir(new_abs_path):
+            return f"Error: Path '{path}' is not a directory"
+        
+        # Update the current directory
+        _current_search_directory = new_abs_path
+        
+        # Calculate relative path from repo root for display
+        rel_path = os.path.relpath(_current_search_directory, _repo_root_path)
+        display_path = '/' + rel_path if rel_path != '.' else '/'
+        
+        # Get directory contents for the new location
+        contents = list_directory('.')
+        
+        return f"Changed directory to {display_path}\n\nContents:\n{contents}"
     
-    # Format the result
-    result = f"Changed directory to {relative_path}\n\nDirectories:\n"
-    result += "\n".join(dirs) if dirs else "No directories"
-    result += "\n\nFiles:\n"
-    result += "\n".join(files) if files else "No files"
-    
-    return result
+    except Exception as e:
+        return f"Error navigating to directory: {str(e)}"
 
 
 @tool
-def list_directory(path: Optional[str] = None) -> str:
+def list_directory(path: str = '.') -> str:
     """
     List contents of a directory.
     
     Args:
-        path: Optional path to list. If not provided, lists the current directory.
+        path: Path to list, relative to current directory or absolute from repo root.
+              Defaults to current directory ('.').
+              Supports '..' to reference parent directory and '.' for current directory.
         
     Returns:
-        String representation of directory contents.
+        String listing of directory contents or an error message.
     """
-    global _current_search_directory
+    global _current_search_directory, _repo_root_path
     
     if not _current_search_directory:
         return "Error: Repository search has not been initialized."
     
-    # Determine which directory to list
-    if path:
+    try:
+        # Handle absolute paths
         if path.startswith('/'):
-            dir_to_list = os.path.join(_repo_root_path, path.lstrip('/'))
+            full_path = os.path.normpath(os.path.join(_repo_root_path, path.lstrip('/')))
         else:
-            dir_to_list = os.path.normpath(os.path.join(_current_search_directory, path))
-    else:
-        dir_to_list = _current_search_directory
-        path = os.path.relpath(dir_to_list, _repo_root_path)
-        if path == '.':
-            path = '/'
-        else:
-            path = '/' + path
-    
-    # Verify the directory exists
-    if not os.path.exists(dir_to_list):
-        return f"Error: Directory '{path}' does not exist"
-    if not os.path.isdir(dir_to_list):
-        return f"Error: Path '{path}' is not a directory"
-    
-    # Get directory contents
-    dirs, files = [], []
-    for entry in sorted(os.listdir(dir_to_list)):
-        entry_path = os.path.join(dir_to_list, entry)
-        # Skip hidden files/dirs
-        if entry.startswith('.'):
-            continue
-        # Skip large dirs like node_modules
-        if os.path.isdir(entry_path) and entry in ['node_modules', 'dist', 'build', 'coverage']:
-            continue
+            # Handle relative paths (including . and ..)
+            full_path = os.path.normpath(os.path.join(_current_search_directory, path))
         
-        if os.path.isdir(entry_path):
-            dirs.append(f"{entry}/")
-        else:
-            files.append(entry)
+        # Ensure we don't list outside the repo root
+        if not full_path.startswith(_repo_root_path):
+            return f"Error: Cannot list directories outside the repository root."
+        
+        # Verify the directory exists
+        if not os.path.exists(full_path):
+            return f"Error: Path '{path}' does not exist"
+        if not os.path.isdir(full_path):
+            return f"Error: Path '{path}' is not a directory"
+        
+        # Calculate relative path from repo root for display
+        rel_path = os.path.relpath(full_path, _repo_root_path)
+        display_path = '/' + rel_path if rel_path != '.' else '/'
+        
+        # Get directory contents
+        entries = sorted(os.listdir(full_path))
+        
+        # Organize into dirs and files
+        dirs = []
+        files = []
+        for entry in entries:
+            entry_path = os.path.join(full_path, entry)
+            if os.path.isdir(entry_path):
+                dirs.append(f"{entry}/")
+            else:
+                files.append(entry)
+        
+        # Skip certain directories if they exist
+        skip_dirs = ['node_modules', '.git', 'dist', 'build']
+        dirs = [d for d in dirs if d.rstrip('/') not in skip_dirs]
+        
+        # Format the output
+        output = [f"Contents of {display_path}:"]
+        
+        if dirs:
+            output.append("\nDirectories:")
+            for d in dirs:
+                output.append(f"  {d}")
+        
+        if files:
+            output.append("\nFiles:")
+            for f in files:
+                output.append(f"  {f}")
+        
+        if not dirs and not files:
+            output.append("\nEmpty directory")
+        
+        return "\n".join(output)
     
-    # Format the result
-    result = f"Contents of {path}:\n\nDirectories:\n"
-    result += "\n".join(dirs) if dirs else "No directories"
-    result += "\n\nFiles:\n"
-    result += "\n".join(files) if files else "No files"
-    
-    return result
+    except Exception as e:
+        return f"Error listing directory: {str(e)}"
 
 
 @tool
@@ -295,29 +303,34 @@ def read_file(path: str) -> str:
     Read the content of a file.
     
     Args:
-        path: Path to the file to read, relative to current directory or absolute from repo root
+        path: Path to the file to read, relative to current directory or absolute from repo root.
+              Supports '..' to go up one directory level and '.' to reference current directory.
         
     Returns:
         Content of the file or error message.
     """
-    global _current_search_directory
+    global _current_search_directory, _repo_root_path
     
     if not _current_search_directory:
         return "Error: Repository search has not been initialized."
     
-    # Normalize path handling
-    if path.startswith('/'):
-        full_path = os.path.join(_repo_root_path, path.lstrip('/'))
-    else:
-        full_path = os.path.normpath(os.path.join(_current_search_directory, path))
-    
-    # Verify the file exists
-    if not os.path.exists(full_path):
-        return f"Error: File '{path}' does not exist"
-    if not os.path.isfile(full_path):
-        return f"Error: Path '{path}' is not a file"
-    
     try:
+        # Normalize path handling
+        if path.startswith('/'):
+            full_path = os.path.normpath(os.path.join(_repo_root_path, path.lstrip('/')))
+        else:
+            full_path = os.path.normpath(os.path.join(_current_search_directory, path))
+        
+        # Ensure we can't read files outside the repo root
+        if not full_path.startswith(_repo_root_path):
+            return f"Error: Cannot read files outside the repository root."
+        
+        # Verify the file exists
+        if not os.path.exists(full_path):
+            return f"Error: File '{path}' does not exist"
+        if not os.path.isfile(full_path):
+            return f"Error: Path '{path}' is not a file"
+        
         with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
         if len(content) > 10000:
