@@ -1600,18 +1600,15 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         from typing import List, Optional as OptionalType
         
         # Define the structured output schema
-        class ReactComponent(BaseModel):
-            filename: str = Field(..., description="Filename for the component (e.g., 'Component.tsx', 'utils/helpers.ts')")
-            content: str = Field(..., description="Complete source code for the component")
-            description: OptionalType[str] = Field(None, description="Brief description of what this component does")
-            entrypoint: bool = Field(False, description="Whether this is the main component file")
+        class File(BaseModel):
+            filename: str = Field(description="Filename for the component (e.g., 'Component.tsx', 'utils/helpers.ts')")
+            content: str = Field(description="Complete source code for the component")
         
-        class ReactConversion(BaseModel):
-            components: List[ReactComponent] = Field(..., description="List of React component files")
-            explanation: OptionalType[str] = Field(None, description="Overall explanation of the conversion approach")
+        class ReactConversionFiles(BaseModel):
+            files: List[File] = Field(description="List of React component files")
         
         # Configure the LLM for structured output
-        structured_llm = self.llm.with_structured_output(ReactConversion)
+        structured_llm = self.llm.with_structured_output(ReactConversionFiles)
         
         # Prepare the context for the LLM
         system_prompt = """You are an expert at converting legacy web applications to modern React TypeScript applications.
@@ -1652,11 +1649,11 @@ Guidelines:
                 "components": {}
             }
             
-            for component in response.components:
-                result["components"][component.filename] = {
-                    "content": component.content,
-                    "description": component.description or "",
-                    "entrypoint": component.entrypoint
+            for file in response.files:
+                result["components"][file.filename] = {
+                    "content": file.content,
+                    "description": file.description or "",
+                    "entrypoint": file.entrypoint
                 }
                 
             if response.explanation:
