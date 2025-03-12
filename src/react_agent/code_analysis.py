@@ -11,12 +11,11 @@ from pathlib import Path
 import json
 import time
 import logging
-from functools import lru_cache
 import hashlib
 
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.prompts import PromptTemplate
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from react_agent.ChaseAzureOpenAI import getModel
 from langchain.memory import ConversationBufferMemory
 from react_agent.tools import (
@@ -51,24 +50,6 @@ class CodeAnalyzer:
         self.start_time = None
         # For caching large responses
         self.analysis_cache = {}
-        
-    @lru_cache(maxsize=100)
-    def _cached_llm_call(self, prompt_key, **kwargs):
-        """Cache LLM calls to avoid repetitive API requests."""
-        # This is a simplified approach - in production you might 
-        # want a more robust caching mechanism
-        cache_key = f"{prompt_key}:{hash(frozenset(kwargs.items()))}"
-        if cache_key in self.analysis_cache:
-            return self.analysis_cache[cache_key]
-        
-        # Add jitter to avoid rate limits
-        time.sleep(0.1)
-        
-        # Check for timeout
-        if self.start_time and time.time() - self.start_time > self.timeout:
-            raise TimeoutError("Analysis timed out. Consider analyzing fewer files or increasing timeout.")
-        
-        return None  # No cached result
     
     def analyze_repo(self, repo_url: str, screen_id: str) -> Dict[str, Any]:
         """
@@ -1383,8 +1364,312 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             "full_requirements": requirements
         }
 
+    def find_all_view_files(self, repo_path: str) -> List[Path]:
+        """
+        Find all view files in the repository by locating 'view' or 'views' directories.
+        
+        Args:
+            repo_path: Path to the repository root
+            
+        Returns:
+            List of paths to view files
+        """
+        logger.info(f"Finding all view files in {repo_path}")
+        view_files = []
+        view_dir_names = ['view', 'views']
+        
+        # Walk through the repository to find view directories
+        for root, dirs, files in os.walk(repo_path):
+            # Skip certain directories that won't contain views
+            dirs[:] = [d for d in dirs if d.lower() not in [
+                'node_modules', '.git', 'test', 'tests', '__tests__', 
+                'spec', 'specs', 'e2e', 'dist', 'build'
+            ]]
+            
+            # Check if current directory is a view directory
+            current_dir = os.path.basename(root).lower()
+            is_view_dir = current_dir in view_dir_names
+            
+            # Also check if any parent directory in the path is a view directory
+            path_parts = Path(root).relative_to(repo_path).parts
+            has_view_parent = any(part.lower() in view_dir_names for part in path_parts)
+            
+            if is_view_dir or has_view_parent:
+                # Add all JavaScript/TypeScript files in this directory
+                for file in files:
+                    if file.endswith(('.js', '.jsx', '.ts', '.tsx', '.hbs', '.handlebars', '.mustache', '.html')):
+                        view_file_path = Path(os.path.join(root, file))
+                        view_files.append(view_file_path)
+                        logger.info(f"Found view file: {view_file_path}")
+        
+        logger.info(f"Found {len(view_files)} view files in total")
+        return view_files
 
-def analyze_blueJS_repo(repo_url: str, screen_id: str) -> Dict[str, Any]:
+    def analyze_view_dependencies(self, view_file: Path, repo_path: str) -> List[Path]:
+        """
+        Analyze a view file to find all its dependencies (imports/requires and templates).
+        
+        Args:
+            view_file: Path to the view file
+            repo_path: Path to the repository root
+            
+        Returns:
+            List of paths to dependent files
+        """
+        logger.info(f"Analyzing dependencies for view file: {view_file}")
+        dependencies = set()
+        dependencies.add(view_file)  # Include the original view file
+        
+        # Reset visited files for this analysis
+        self.visited_files = set()
+        
+        # Start recursive dependency analysis
+        self._analyze_file_dependencies_recursive(view_file, repo_path, dependencies)
+        
+        logger.info(f"Found {len(dependencies)} dependencies for {view_file}")
+        return list(dependencies)
+
+    def _analyze_file_dependencies_recursive(self, file_path: Path, repo_path: str, dependencies: Set[Path]):
+        """
+        Recursively analyze a file to find its dependencies.
+        
+        Args:
+            file_path: Path to the file to analyze
+            repo_path: Path to the repository root
+            dependencies: Set to collect dependent files
+        """
+        if file_path in self.visited_files:
+            return
+        
+        self.visited_files.add(file_path)
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Find all imports and requires
+            import_patterns = [
+                r'import\s+[\w\{\},\s*]+\s+from\s+[\'"]([^\'"]+)[\'"]',  # ES6 imports
+                r'require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)',  # CommonJS requires
+                r'define\s*\(\s*\[[^\]]*[\'"]([^\'"]+)[\'"][^\]]*\]',  # AMD define dependencies
+                r'@import\s+[\'"]([^\'"]+)[\'"]',  # CSS imports
+                r'templateUrl\s*:\s*[\'"]([^\'"]+)[\'"]',  # Template URLs
+                r'<include\s+src=[\'"]([^\'"]+)[\'"]',  # HTML includes
+                r'<link[^>]*href=[\'"]([^\'"]+)[\'"]',  # CSS links
+                r'<script[^>]*src=[\'"]([^\'"]+)[\'"]',  # Script tags
+            ]
+            
+            for pattern in import_patterns:
+                for match in re.finditer(pattern, content):
+                    imported_path = match.group(1)
+                    
+                    # Skip external modules and absolute paths
+                    if (imported_path.startswith('http') or 
+                        imported_path.startswith('/') or 
+                        imported_path.startswith('@angular') or
+                        not '/' in imported_path):
+                        continue
+                    
+                    # Resolve relative imports
+                    full_path = self._resolve_import_path(imported_path, file_path, repo_path)
+                    if full_path and full_path.exists():
+                        logger.debug(f"Found dependency: {full_path}")
+                        dependencies.add(full_path)
+                        
+                        # Recursively analyze this dependency
+                        self._analyze_file_dependencies_recursive(full_path, repo_path, dependencies)
+        
+        except Exception as e:
+            logger.error(f"Error analyzing dependencies for {file_path}: {str(e)}")
+
+    def _resolve_import_path(self, import_path: str, current_file: Path, repo_path: str) -> Optional[Path]:
+        """
+        Resolve an import path to an absolute file path.
+        
+        Args:
+            import_path: The import path from the source code
+            current_file: The file containing the import
+            repo_path: Path to the repository root
+            
+        Returns:
+            Resolved absolute file path or None if not found
+        """
+        # Handle alias paths first (e.g., @app/component)
+        if import_path.startswith('@') and '/' in import_path:
+            for alias, alias_path in self.alias_map.items():
+                if import_path.startswith(alias):
+                    relative_path = import_path[len(alias):].lstrip('/')
+                    return Path(os.path.join(repo_path, alias_path, relative_path))
+        
+        # Handle relative paths
+        if import_path.startswith('./') or import_path.startswith('../'):
+            base_dir = current_file.parent
+            relative_path = os.path.normpath(os.path.join(base_dir, import_path))
+            return Path(relative_path)
+        
+        # Handle absolute paths relative to repo root
+        return Path(os.path.join(repo_path, import_path))
+
+    def convert_views_to_react(self, repo_url: str) -> Dict[str, Any]:
+        """
+        Find all view files and convert them to React components.
+        
+        Args:
+            repo_path: Path to the repository root
+            
+        Returns:
+            Dictionary containing conversion results
+        """
+        logger.info(f"Starting view-to-React conversion for {repo_url}")
+        self.start_time = time.time()
+
+        # Ensure the repository storage directory exists
+        os.makedirs(REPO_STORAGE_DIR, exist_ok=True)
+        
+        # Clone the repository to our dedicated storage location
+        repo_path = self._clone_repo(repo_url, REPO_STORAGE_DIR)
+        
+        # Find all view files
+        view_files = self.find_all_view_files(repo_path)
+        
+        # Parse configuration files for path aliases
+        self._parse_config_files(repo_path)
+        logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
+        
+        # Process each view file
+        conversion_results = {}
+        for view_file in view_files:
+            try:
+                logger.info(f"Processing view file: {view_file}")
+                
+                # Analyze dependencies for this view
+                dependencies = self.analyze_view_dependencies(view_file, repo_path)
+                
+                # Read all dependent files
+                dependent_files_content = {}
+                for dep_file in dependencies:
+                    try:
+                        with open(dep_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            file_content = f.read()
+                        relative_path = os.path.relpath(dep_file, repo_path)
+                        dependent_files_content[relative_path] = file_content
+                    except Exception as e:
+                        logger.error(f"Error reading dependent file {dep_file}: {str(e)}")
+                
+                # Convert to React using LLM
+                react_components = self._convert_to_react(view_file, dependent_files_content)
+                
+                # Store results
+                relative_view_path = os.path.relpath(view_file, repo_path)
+                conversion_results[relative_view_path] = {
+                    "original_view": str(view_file),
+                    "dependencies": [str(dep) for dep in dependencies],
+                    "react_components": react_components
+                }
+                
+            except Exception as e:
+                logger.error(f"Error processing view file {view_file}: {str(e)}")
+                conversion_results[str(view_file)] = {
+                    "error": str(e)
+                }
+        
+        elapsed_time = time.time() - self.start_time
+        logger.info(f"View-to-React conversion completed in {elapsed_time:.2f} seconds")
+        
+        return {
+            "conversion_results": conversion_results,
+            "view_count": len(view_files),
+            "analysis_time_seconds": elapsed_time
+        }
+
+    def _convert_to_react(self, view_file: Path, dependent_files_content: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Use LLM to convert a view file and its dependencies to React components with structured output.
+        
+        Args:
+            view_file: Path to the view file
+            dependent_files_content: Dictionary mapping file paths to their content
+            
+        Returns:
+            Dictionary containing React components
+        """
+        logger.info(f"Converting {view_file} to React components")
+        
+        # Import pydantic models for structured output
+        from pydantic import BaseModel, Field
+        from typing import List, Optional as OptionalType
+        
+        # Define the structured output schema
+        class ReactComponent(BaseModel):
+            filename: str = Field(..., description="Filename for the component (e.g., 'Component.tsx', 'utils/helpers.ts')")
+            content: str = Field(..., description="Complete source code for the component")
+            description: OptionalType[str] = Field(None, description="Brief description of what this component does")
+            entrypoint: bool = Field(False, description="Whether this is the main component file")
+        
+        class ReactConversion(BaseModel):
+            components: List[ReactComponent] = Field(..., description="List of React component files")
+            explanation: OptionalType[str] = Field(None, description="Overall explanation of the conversion approach")
+        
+        # Configure the LLM for structured output
+        structured_llm = self.llm.with_structured_output(ReactConversion)
+        
+        # Prepare the context for the LLM
+        system_prompt = """You are an expert at converting legacy web applications to modern React TypeScript applications.
+Your task is to convert view files and their dependencies to React components.
+
+Guidelines:
+- Convert view context variables to props
+- Convert model data to state
+- Convert templates to React JSX components
+- For unrecognized web components, import them from '@mds/react' with PascalCase names
+- Props for MDS React components should be camelCase
+- Place utility functions in appropriate files inside a utils folder
+- Convert require('@octagon/...') to import statements
+- Return a structured collection of files that together implement the view in React
+- Mark the main component file as the entrypoint
+"""
+        
+        user_prompt = """Here are the files involved in this view that need to be converted to React:
+"""
+        
+        # Add file contents to the prompt
+        for file_path, content in dependent_files_content.items():
+            user_prompt += f"\n\nFile: {file_path}\n```\n{content}\n```"
+        
+        # Call LLM to convert to React with structured output
+        try:
+            from langchain_core.messages import SystemMessage, HumanMessage
+            
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
+            ]
+            
+            response = structured_llm.invoke(messages)
+            
+            # Convert the structured output to our standard format
+            result = {
+                "components": {}
+            }
+            
+            for component in response.components:
+                result["components"][component.filename] = {
+                    "content": component.content,
+                    "description": component.description or "",
+                    "entrypoint": component.entrypoint
+                }
+                
+            if response.explanation:
+                result["explanation"] = response.explanation
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error converting {view_file} to React: {str(e)}")
+            return {"error": str(e)}
+
+
+def convert_blueJS_repo(repo_url: str) -> Dict[str, Any]:
     """
     Analyze a BlueJS repository to extract requirements and convert to React.
     
@@ -1396,7 +1681,7 @@ def analyze_blueJS_repo(repo_url: str, screen_id: str) -> Dict[str, Any]:
         Dictionary containing analysis results, requirements and converted React components
     """
     analyzer = CodeAnalyzer()
-    return analyzer.analyze_repo(repo_url, screen_id)
+    return analyzer.convert_views_to_react(repo_url)
 
 
 if __name__ == "__main__":
@@ -1410,14 +1695,13 @@ if __name__ == "__main__":
     
     # Get repo_url and screen_id from environment variables
     repo_url = os.getenv("REPO_URL")
-    screen_id = os.getenv("SCREEN_ID")
     
     # Validate that we have the required environment variables
-    if not repo_url or not screen_id:
-        print("Error: REPO_URL and SCREEN_ID must be set in .env file")
+    if not repo_url:
+        print("Error: REPO_URL must be set in .env file")
         sys.exit(1)
     
     # Run the analysis
-    result = analyze_blueJS_repo(repo_url, screen_id)
+    result = convert_blueJS_repo(repo_url)
     print(result)
 
