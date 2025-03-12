@@ -1510,78 +1510,6 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         # Handle absolute paths relative to repo root
         return Path(os.path.join(repo_path, import_path))
 
-    def convert_views_to_react(self, repo_url: str) -> Dict[str, Any]:
-        """
-        Find all view files and convert them to React components.
-        
-        Args:
-            repo_path: Path to the repository root
-            
-        Returns:
-            Dictionary containing conversion results
-        """
-        logger.info(f"Starting view-to-React conversion for {repo_url}")
-        self.start_time = time.time()
-
-        # Ensure the repository storage directory exists
-        os.makedirs(REPO_STORAGE_DIR, exist_ok=True)
-        
-        # Clone the repository to our dedicated storage location
-        repo_path = self._clone_repo(repo_url, REPO_STORAGE_DIR)
-        
-        # Find all view files
-        view_files = self.find_all_view_files(repo_path)
-        
-        # Parse configuration files for path aliases
-        self._parse_config_files(repo_path)
-        logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
-        
-        # Process each view file
-        conversion_results = {}
-        for view_file in view_files:
-            try:
-                logger.info(f"Processing view file: {view_file}")
-                
-                # Analyze dependencies for this view
-                dependencies = self.analyze_view_dependencies(view_file, repo_path)
-                
-                # Read all dependent files
-                dependent_files_content = {}
-                for dep_file in dependencies:
-                    try:
-                        with open(dep_file, 'r', encoding='utf-8', errors='ignore') as f:
-                            file_content = f.read()
-                        relative_path = os.path.relpath(dep_file, repo_path)
-                        dependent_files_content[relative_path] = file_content
-                    except Exception as e:
-                        logger.error(f"Error reading dependent file {dep_file}: {str(e)}")
-                
-                # Convert to React using LLM
-                react_components = self._convert_to_react(view_file, dependent_files_content)
-                
-                # Store results
-                relative_view_path = os.path.relpath(view_file, repo_path)
-                conversion_results[relative_view_path] = {
-                    "original_view": str(view_file),
-                    "dependencies": [str(dep) for dep in dependencies],
-                    "react_components": react_components
-                }
-                
-            except Exception as e:
-                logger.error(f"Error processing view file {view_file}: {str(e)}")
-                conversion_results[str(view_file)] = {
-                    "error": str(e)
-                }
-        
-        elapsed_time = time.time() - self.start_time
-        logger.info(f"View-to-React conversion completed in {elapsed_time:.2f} seconds")
-        
-        return {
-            "conversion_results": conversion_results,
-            "view_count": len(view_files),
-            "analysis_time_seconds": elapsed_time
-        }
-
     def _convert_to_react(self, view_file: Path, dependent_files_content: Dict[str, str]) -> Dict[str, Any]:
         """
         Use LLM to convert a view file and its dependencies to React components with structured output.
@@ -1620,18 +1548,48 @@ Guidelines:
 - Convert templates to React JSX components
 - For unrecognized web components, import them from '@mds/react' with PascalCase names
 - Props for MDS React components should be camelCase
-- Place utility functions in appropriate files inside a utils folder
-- Convert require('@octagon/...') to import statements
 - Return a structured collection of files that together implement the view in React
 - Mark the main component file as the entrypoint
+
+Organize files in the following folder structure:
+- components/: Place all React components here (the entrypoint should be directly in this folder)
+- utils/: Place utility functions, helpers, and services here
+- types/: Place TypeScript interfaces, types, and enums here
+- settings/: Place configuration, constants, and default values here
+
+For imports:
+- Convert require('@octagon/...') to ES6 import statements
+- Keep external library imports (both @octagon and npm packages)
+- Use relative imports for your own files
 """
         
-        user_prompt = """Here are the files involved in this view that need to be converted to React:
+        # Find the relative view path
+        try:
+            # Get a sample path to extract the repo base path
+            sample_path = next(iter(dependent_files_content.keys()))
+            base_path = os.path.commonpath(list(dependent_files_content.keys()))
+            relative_view_path = os.path.relpath(view_file, os.path.join(os.path.dirname(sample_path), base_path))
+        except (StopIteration, ValueError):
+            # Fallback if we can't determine the relative path
+            relative_view_path = os.path.basename(view_file)
+        
+        user_prompt = f"""Here are the files involved in this view that need to be converted to React:
+
+MAIN VIEW FILE:
+File: {os.path.basename(view_file)}
+```
+{dependent_files_content.get(str(view_file), open(view_file, 'r', encoding='utf-8', errors='ignore').read())}
+```
+
+DEPENDENCIES:
 """
         
-        # Add file contents to the prompt
+        # Add dependent file contents to the prompt, ensuring we don't duplicate the main view file
+        view_file_str = str(view_file)
         for file_path, content in dependent_files_content.items():
-            user_prompt += f"\n\nFile: {file_path}\n```\n{content}\n```"
+            # Skip the main view file as we've already included it
+            if file_path != view_file_str and file_path != os.path.basename(view_file):
+                user_prompt += f"\nFile: {file_path}\n```\n{content}\n```"
         
         # Call LLM to convert to React with structured output
         try:
@@ -1650,8 +1608,6 @@ Guidelines:
             }
             
             for file in response.files:
-                logger.info(f"Created {file.filename}.")
-                logger.info(f"Contents: \n{file.content}")
                 result["components"][file.filename] = {
                     "content": file.content,
                 }
@@ -1661,6 +1617,136 @@ Guidelines:
         except Exception as e:
             logger.error(f"Error converting {view_file} to React: {str(e)}")
             return {"error": str(e)}
+
+    def save_react_components(self, components: Dict[str, Dict[str, Any]], output_dir: Path) -> Dict[str, Any]:
+        """
+        Save the generated React components to the specified output directory.
+        
+        Args:
+            components: Dictionary of component filenames to their content
+            output_dir: Path to the output directory
+            
+        Returns:
+            Dictionary with information about saved files
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create standard directories
+        for dir_name in ["components", "utils", "types", "settings"]:
+            os.makedirs(output_dir / dir_name, exist_ok=True)
+        
+        # Save each component
+        saved_files = []
+        for filename, component_info in components.items():
+            if filename == "_explanation" or not component_info.get("content"):
+                continue
+            
+            # Determine the full path
+            file_path = output_dir / filename
+            
+            # Create any necessary subdirectories
+            os.makedirs(file_path.parent, exist_ok=True)
+            
+            # Write the file
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(component_info["content"])
+            
+            saved_files.append(str(file_path))
+            logger.info(f"Saved component to {file_path}")
+        
+        return {
+            "output_dir": str(output_dir),
+            "saved_files": saved_files,
+            "file_count": len(saved_files)
+        }
+
+    def convert_views_to_react(self, repo_url: str) -> Dict[str, Any]:
+        """
+        Find all view files and convert them to React components.
+        
+        Args:
+            repo_url: URL of the git repository to clone and analyze
+            
+        Returns:
+            Dictionary containing conversion results
+        """
+        logger.info(f"Starting view-to-React conversion for {repo_url}")
+        self.start_time = time.time()
+
+        # Ensure the repository storage directory exists
+        os.makedirs(REPO_STORAGE_DIR, exist_ok=True)
+        
+        # Clone the repository to our dedicated storage location
+        repo_path = self._clone_repo(repo_url, REPO_STORAGE_DIR)
+        
+        # Find all view files
+        view_files = self.find_all_view_files(repo_path)
+        
+        # Parse configuration files for path aliases
+        self._parse_config_files(repo_path)
+        logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
+        
+        # Create output directory for React components
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        output_base_dir = Path(f"converted_views_{timestamp}")
+        os.makedirs(output_base_dir, exist_ok=True)
+        
+        # Process each view file
+        conversion_results = {}
+        for view_file in view_files:
+            try:
+                logger.info(f"Processing view file: {view_file}")
+                
+                # Create a specific output directory for this view
+                view_name = os.path.splitext(os.path.basename(view_file))[0]
+                output_dir = output_base_dir / view_name
+                
+                # Analyze dependencies for this view
+                dependencies = self.analyze_view_dependencies(view_file, repo_path)
+                
+                # Read all dependent files
+                dependent_files_content = {}
+                for dep_file in dependencies:
+                    try:
+                        with open(dep_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            file_content = f.read()
+                        relative_path = os.path.relpath(dep_file, repo_path)
+                        dependent_files_content[relative_path] = file_content
+                    except Exception as e:
+                        logger.error(f"Error reading dependent file {dep_file}: {str(e)}")
+                
+                # Convert to React using LLM
+                react_components = self._convert_to_react(view_file, dependent_files_content)
+                
+                # Save the React components
+                if "components" in react_components:
+                    save_result = self.save_react_components(react_components["components"], output_dir)
+                    react_components["save_result"] = save_result
+                
+                # Store results
+                relative_view_path = os.path.relpath(view_file, repo_path)
+                conversion_results[relative_view_path] = {
+                    "original_view": str(view_file),
+                    "dependencies": [str(dep) for dep in dependencies],
+                    "react_components": react_components,
+                    "output_dir": str(output_dir)
+                }
+                
+            except Exception as e:
+                logger.error(f"Error processing view file {view_file}: {str(e)}")
+                conversion_results[str(view_file)] = {
+                    "error": str(e)
+                }
+        
+        elapsed_time = time.time() - self.start_time
+        logger.info(f"View-to-React conversion completed in {elapsed_time:.2f} seconds")
+        
+        return {
+            "conversion_results": conversion_results,
+            "view_count": len(view_files),
+            "analysis_time_seconds": elapsed_time,
+            "output_base_dir": str(output_base_dir)
+        }
 
 
 def convert_blueJS_repo(repo_url: str) -> Dict[str, Any]:
