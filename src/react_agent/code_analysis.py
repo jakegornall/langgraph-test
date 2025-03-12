@@ -4,7 +4,6 @@ Code analysis module to extract requirements and convert BlueJS applications to 
 
 import os
 import subprocess
-import tempfile
 import shutil
 from typing import Dict, List, Tuple, Optional, Any, Set
 import re
@@ -15,15 +14,16 @@ import logging
 from functools import lru_cache
 import hashlib
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.prompts import PromptTemplate
+from pydantic import BaseModel
 from react_agent.ChaseAzureOpenAI import getModel
 from langchain.memory import ConversationBufferMemory
-from pydantic import BaseModel, Field
 from react_agent.tools import (
     setup_repo_search, navigate_directory, list_directory, 
-    read_file, find_controller, TOOLS
+    read_file, find_controller
 )
+from react_agent.models import DependencyList
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -120,27 +120,11 @@ class CodeAnalyzer:
         # Analyze the controller file and its dependencies
         controller_analysis = self._analyze_file_dependencies(controller_file, repo_path)
         
-        # Find action function in controller
-        action_code, action_details = self._find_action_function(controller_file, action)
-        if not action_code:
-            raise ValueError(f"Could not find action '{action}' in controller {controller_file}")
-                
-        logger.info(f"Found action function: {action}")
-        
-        # Find templates used by this action and related files
-        templates = self._find_templates(repo_path, action_code, controller_file, action_details)
-        logger.info(f"Found {len(templates)} templates")
-        
-        # Convert templates to React components
-        react_components = self._convert_templates_to_react(templates)
-        
         # Analyze code to generate requirements with dependency context
         requirements = self._generate_requirements_with_context(
             repo_path, 
-            controller_file, 
-            action_code, 
-            file_tree, 
-            templates,
+            controller_file,
+            file_tree,
             controller_analysis
         )
         
@@ -152,10 +136,6 @@ class CodeAnalyzer:
             "file_tree": file_tree,
             "controller_file": str(controller_file),
             "action_function": action,
-            "action_code": action_code,
-            "action_details": action_details,
-            "templates": templates,
-            "react_components": react_components,
             "requirements": requirements,
             "dependencies": self.dependency_graph,
             "path_aliases": self.alias_map,
@@ -332,11 +312,6 @@ class CodeAnalyzer:
         Returns:
             Path to the controller file or None if not found
         """
-        from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-        from react_agent.tools import (
-            setup_repo_search, navigate_directory, list_directory, 
-            read_file, find_controller
-        )
         
         logger.info(f"Using LLM to find controller file for screen ID: {screen_id}")
         
@@ -632,45 +607,7 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         
         logger.warning(f"Could not find controller file for {screen_id} with heuristic")
         return None
-    
-    def _find_action_function(self, controller_file: Path, action_name: str) -> Tuple[str, Dict[str, Any]]:
-        """Extract the action function and its details from the controller file."""
-        with open(controller_file, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            
-        # Use AI to extract the action function
-        action_extraction_prompt = PromptTemplate.from_template(
-            """You are analyzing a BlueJS controller file. Extract the '{action_name}' action function.
-            
-            Controller file content:
-            ```javascript
-            {file_content}
-            ```
-            
-            1. Extract the complete code for the '{action_name}' function
-            2. Identify any relevant details:
-               - Templates it renders
-               - API endpoints it calls
-               - Data models it interacts with
-               - Parameters it uses
-            
-            Format your response as JSON with the following structure:
-            {{
-                "function_code": "full function code here",
-                "templates": ["list of template names"],
-                "api_endpoints": ["list of API endpoints"],
-                "data_models": ["list of data models"],
-                "parameters": ["list of parameters"]
-            }}
-            """
-        )
-        
-        message_content = action_extraction_prompt.format(file_content=content)
-        response = self.llm.invoke([HumanMessage(content=message_content)])
-        
-        result = json.loads(response.content)
-        
-        return result.get("function_code", ""), result
+
     
     def _find_templates(self, repo_path: str, action_code: str, controller_file: Path, action_details: Dict[str, Any]) -> List[Dict[str, str]]:
         """Find templates referenced in the action code and related files."""
@@ -831,7 +768,7 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             try:
                 # Create a prompt to convert the template
                 conversion_prompt = PromptTemplate.from_template(
-                    """Convert this BlueJS template to a React component with Material-UI:
+                    """Convert this BlueJS template to a React component:
                     
                     Template name: {name}
                     Template path: {path}
@@ -842,12 +779,10 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
                     
                     Please convert this to a modern React component:
                     1. Use functional components with hooks
-                    2. Use Material-UI for styling and components
-                    3. Handle any mustache/handlebars expressions properly
-                    4. Convert BlueJS specific patterns to React patterns
-                    5. Ensure proper prop handling
+                    2. Handle any mustache/handlebars expressions properly
+                    3. Ensure proper prop handling
                     
-                    Return just the React component code without any explanations.
+                    Return just the React component code without any explanations or extra text so we can simply take your output and save it to file.
                     """
                 )
                 
@@ -1166,7 +1101,7 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         
         logger.info(f"Added {len(self.alias_map)} potential implicit aliases")
     
-    def _analyze_file_dependencies(self, file_path: Path, repo_path: str, depth: int = 0) -> Dict[str, Any]:
+    def _analyze_file_dependencies(self, file_path: Path, repo_path: str) -> Dict[str, Any]:
         """
         Recursively analyze a file and its dependencies.
         
@@ -1178,10 +1113,11 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         Returns:
             Dictionary with file analysis information
         """
-        if depth > 5:  # Limit recursion depth
-            return {"message": "Max recursion depth reached"}
+
+        resolved_dependencies = {}
             
         if file_path in self.visited_files:
+            logger.info(f"Already visited {file_path}")
             return {"message": "Already visited"}
             
         self.visited_files.add(file_path)
@@ -1190,56 +1126,66 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
         except Exception as e:
+            logger.warning(f"Could not read file {file_path}: {str(e)}")
             return {"error": f"Could not read file {file_path}: {str(e)}"}
             
         # Extract define/require dependencies
+        logger.info(f"Analyzing {file_path}")
         dependencies = self._extract_dependencies(content, file_path)
         self.dependency_graph[str(file_path)] = dependencies
         
         # Use LLM to analyze the file content
         analysis_prompt = PromptTemplate.from_template(
-            """Analyze this JavaScript file from a BlueJS application:
+            """Convert this file to a set of requirements/psuedo code.
+            If any @octagon packages/libraries are used, recommend retaining them as they are compatible with react
+            If any public npm packages are used, recommend retaining those as well for re-useability.
             
+            ONLY REPLY WITH THE REQUIREMENTS. DO NOT ADD ANY OTHER INFORMATION OR COMMENTS.
+
             File path: {file_path}
             
             ```javascript
             {content}
             ```
-            
-            Focus on:
-            1. What does this module do?
-            2. What important state or data does it manage?
-            3. What APIs or services does it interact with?
-            4. Are there any UI components or templates used?
-            5. How might this translate to React patterns?
-            
-            Be concise but comprehensive.
             """
         )
         
-        message_content = analysis_prompt.format(file_path=str(file_path), content=content)
-        response = self.llm.invoke([HumanMessage(content=message_content)])
-        
-        analysis = response.content
-        
-        # Save analysis to memory
-        self.memory.save_context(
-            {"input": f"Analyzed file: {file_path}"}, 
-            {"output": analysis}
-        )
+        retry_count = 3
+
+        while retry_count > 0:
+            try:
+                message_content = analysis_prompt.format(file_path=str(file_path), content=content)
+                response = self.llm.invoke([HumanMessage(content=message_content)])
+                
+                analysis = response.content
+
+                logger.info(f"Analysis: {analysis}")
+                
+                # Save analysis to memory
+                self.memory.save_context(
+                    {"input": f"Analyzed file: {file_path}"},
+                    {"output": analysis}
+                )
+                break
+            except Exception as e:
+                retry_count -= 1
+                if retry_count > 0:
+                    logger.warning(f"Could not analyze file {file_path}: {str(e)}. Retrying...")
+                else:
+                    logger.warning(f"Could not analyze file {file_path}: {str(e)}")
+                    return {"error": f"Could not analyze file {file_path}: {str(e)}"}
         
         # If there are dependencies, let the LLM prioritize which ones to analyze next
         dependency_analysis = {}
         if dependencies:
             # Resolve all dependency paths
-            resolved_dependencies = {}
             for dep in dependencies:
                 dep_path = self._resolve_dependency_path(dep, file_path, repo_path)
                 if dep_path and os.path.exists(dep_path):
                     # Get a preview of the dependency content
                     try:
                         with open(dep_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            preview = f.read(500)  # Just read the first 500 chars for a preview
+                            preview = f.read()
                         resolved_dependencies[dep] = {
                             "path": dep_path,
                             "preview": preview
@@ -1247,51 +1193,13 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
                     except Exception:
                         pass  # Skip if we can't read the file
             
-            if resolved_dependencies:
-                # Ask LLM to prioritize dependencies
-                prioritization_prompt = PromptTemplate.from_template(
-                    """You're analyzing dependencies for a JavaScript file in a BlueJS application.
-                    
-                    Current file being analyzed: {file_path}
-                    File analysis: {file_analysis}
-                    
-                    The file has the following dependencies:
-                    {dependencies}
-                    
-                    Based on the file's purpose and the preview of each dependency, 
-                    select up to 3 most important dependencies to analyze next that would help understand:
-                    1. Core application logic
-                    2. Data flow and state management
-                    3. UI components and rendering
-                    4. API interactions
-                    
-                    Return a JSON array of dependency names in priority order, with the most important first.
-                    Only include dependencies that would be valuable to analyze deeper. Format: ["dep1", "dep2", "dep3"]
-                    """
+        if resolved_dependencies:
+            # Analyze prioritized dependencies
+            for dep in resolved_dependencies:
+                dep_path = resolved_dependencies[dep]["path"]
+                dependency_analysis[dep] = self._analyze_file_dependencies(
+                    Path(dep_path), repo_path
                 )
-                
-                # Format dependencies for the prompt
-                dep_formatted = "\n\n".join([
-                    f"Dependency: {dep}\nPath: {info['path']}\nPreview:\n```javascript\n{info['preview']}...\n```" 
-                    for dep, info in resolved_dependencies.items()
-                ])
-                
-                json_content = prioritization_prompt.format(
-                    file_path=str(file_path),
-                    file_analysis=analysis,
-                    dependencies=dep_formatted
-                )
-                
-                structured_llm = self.llm.with_structured_output(list[str])
-                prioritized_deps = structured_llm.invoke(json_content)
-                
-                # Analyze prioritized dependencies
-                for dep in prioritized_deps:
-                    if dep in resolved_dependencies:
-                        dep_path = resolved_dependencies[dep]["path"]
-                        dependency_analysis[dep] = self._analyze_file_dependencies(
-                            Path(dep_path), repo_path, depth + 1
-                        )
         
         return {
             "path": str(file_path),
@@ -1394,10 +1302,8 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
     def _generate_requirements_with_context(
         self, 
         repo_path: str, 
-        controller_file: Path, 
-        action_code: str, 
-        file_tree: str, 
-        templates: List[Dict[str, str]],
+        controller_file: Path,
+        file_tree: str,
         controller_analysis: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Generate requirements with comprehensive context from dependency analysis."""
@@ -1435,19 +1341,11 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             {controller_content}
             ```
             
-            Main action function:
-            ```javascript
-            {action_code}
-            ```
-            
             Dependency Analysis:
             {dependency_analysis}
             
             Previous file analysis:
             {analysis_context}
-            
-            Template information:
-            {template_info}
             
             Path aliases:
             {config_info}
@@ -1457,17 +1355,13 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             2. Data Flow and State Management - How does the application manage data? What state management would be needed in React?
             3. UI Components - What UI components will need to be created in React based on the templates?
             4. API Integrations - What external services or APIs does the application interact with?
-            5. Routing Structure - How does routing appear to work in this application?
+            5. Routing Structure - How does routing appear to work in this application? What pages/urls exist?
             6. React Implementation Approach - How would you recommend implementing this in React?
             
             Focus on concrete patterns you observe in the code without making assumptions about how BlueJS works internally.
+            The requirements should be detailed enough to completely re-write the application without loss of functionality.
             """
         )
-        
-        template_info = "\n\n".join([
-            f"Template: {t['name']}\nPath: {t['path']}\nContent (snippet):\n{t['content'][:300]}..."
-            for t in templates
-        ]) if templates else "No templates found."
         
         config_info = "\n".join([
             f"- {c['alias']} -> {c['path']}"
@@ -1478,10 +1372,8 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             file_tree=file_tree,
             controller_file=str(controller_file),
             controller_content=controller_content,
-            action_code=action_code,
             dependency_analysis=json.dumps(controller_analysis, indent=2),
             analysis_context=analysis_context,
-            template_info=template_info,
             config_info=config_info
         )
         
