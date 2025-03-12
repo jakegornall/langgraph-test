@@ -1650,14 +1650,11 @@ Guidelines:
             }
             
             for file in response.files:
+                logger.info(f"Created {file.filename}.")
+                logger.info(f"Contents: \n{file.content}")
                 result["components"][file.filename] = {
                     "content": file.content,
-                    "description": file.description or "",
-                    "entrypoint": file.entrypoint
                 }
-                
-            if response.explanation:
-                result["explanation"] = response.explanation
                 
             return result
             
