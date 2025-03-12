@@ -11,6 +11,16 @@ from langgraph.graph import add_messages
 from langgraph.managed import IsLastStep
 from typing import Annotated
 
+import json
+import os
+
+metadataValues = {"package_name": []}
+
+# load metadata file if it exists
+if os.path.exists("metadata.json"):
+    with open('metadata.json') as json_file:
+        metadataValues = json.load(json_file)
+
 @dataclass
 class ComponentMetadata:
     """Metadata about a generated React component."""
@@ -40,8 +50,8 @@ class OutputState:
 class ValidationState:
     """State related to design validation."""
     passed: bool = field(default=False)
-    discrepancies: List[str] = field(default_factory=list)
-    matches: List[str] = field(default_factory=list)
+    discrepancies: List[str] = field(default_factory="")
+    matches: List[str] = field(default_factory="")
 
 @dataclass
 class State(InputState):
@@ -57,9 +67,12 @@ class State(InputState):
     
     # Validation state
     validation: Optional[ValidationState] = field(default=None)
+
+    research_agent_messages: Annotated[Sequence[AnyMessage], add_messages] = field(default_factory=list)
     
     # RAG state
-    relevant_docs: List[Dict[str, Any]] = field(default_factory=list)
+    relevant_docs: str = field(default_factory=list)
+    docs: str = field(default_factory=list)
     
     # Extraction state
     extracted: Optional[Dict[str, str]] = field(default=None)

@@ -1,171 +1,86 @@
 """Tools for React component generation and testing."""
 
-import subprocess
-import sys
 import os
-from typing import Dict, Any, List, Optional
 from pathlib import Path
+from typing import Dict, Any, List
 
-from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import InjectedToolArg, BaseTool, tool
-from typing_extensions import Annotated
-
-from react_agent.configuration import Configuration
-from react_agent.dev_server import DevServer
-from react_agent.models import FileItem, SearchResult, FileContents
+from react_agent.vector_store import vector_store
+from react_agent.models import ResearchQuestion
+from react_agent.ChaseAzureOpenAI import getModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from playwright.sync_api import sync_playwright
 
 # Global variable to track current directory during controller file search
 _current_search_directory = None
 _repo_root_path = None
 
+
 def search_docs(
-    query: str,
-    *,
-    config: Annotated[RunnableConfig, InjectedToolArg]
-) -> List[SearchResult]:
+    queries: List[ResearchQuestion],
+) -> str:
     """
-    Example stub for documentation search.
+    This function returns the search results for the given queries against the vector store that houses our internal docs about Octagon, BlueJS, and MDS.
+    It takes a list of query objects (you can ask multiple questions at once) and returns a string of the results.
     """
-    return [
-        SearchResult(
-            content="Example MUI or relevant documentation results",
-            source="docs/example.md",
-            score=0.95
-        )
-    ]
 
+    model = getModel()
 
-def compile_component(
-    component_code: List[FileItem],
-    dependencies: List[str],
-    *,
-    config: Annotated[RunnableConfig, InjectedToolArg]
-) -> Dict[str, Any]:
-    """
-    Compile the extracted React component using a temporary dev server.
-    Now it expects a top-level project_metadata.dependencies array for npm packages.
-    """
-    server = None
-    try:
-        # Convert the extracted items into the format DevServer expects
-        files_for_dev_server = []
-        for item in component_code:
-            # If it's the entrypoint, rename to "component/index.tsx"
-            # or use item.filename verbatim in "component/" subfolder:
-            filename = (
-                "component/index.tsx"
-                if item["entrypoint"] else
-                f"component/{item["filename"]}"
-            )
-            
-            # Create FileItem instance the correct way
-            file_item = FileItem()
-            file_item.filename = filename
-            file_item.content = item["content"]
-            file_item.file_type = item["file_type"]
-            file_item.entrypoint = item["entrypoint"]
-            
-            files_for_dev_server.append(file_item)
+    result = ""
 
-        server = DevServer(port=Configuration.from_runnable_config(config).dev_server_port)
-        server.setup(
-            {"files": files_for_dev_server},
-            dependencies=dependencies
-        )
+    # get answers from RAG system
+    for query in queries:
+        docs = vector_store.similarity_search(query.question, k=30, filter={"package_name": query.filter})
+        q = f"Question: {query.question}\nChunks:\n\n"
+        for doc in docs:
+            q += f"{doc.page_content}\n\n"
 
-        result = server.start()
-        if not result["success"]:
-            return {"errors": result["errors"]}
-
-        return {
-            "success": True,
-            "dev_server_url": result["dev_server_url"]
-        }
-
-    except Exception as e:
-        return {"errors": [str(e)]}
+        result += q
     
-    finally:
-        # Clean up the dev server and temporary files
-        if server:
-            server.stop()
+    response = model.invoke([
+        SystemMessage(content="You will be provided a set of questions each with a set of chunks retreived from a vector store search. Answer each question using the context provided. If the answer isn't in the context chunks, just say there wasn't enough info found in the docs. Format in an ordered list in markdown. Be detailed and include all code examples where possible so the larger system you pass this too can know how to write the application code that will be using these answers."),
+        HumanMessage(content=result),
+    ])
 
+    return response.content
 
-def _take_screenshots_process(url: str) -> Dict[str, str]:
+def search_chase_interweb(url: str) -> str:
+    """Searches the interweb for the given URL and return the page content.
+    Important links:
+    Octagon Libraries and API References: https://octagon-docs.dev.sch.jpmchase.net/reference/
+    Octagon Getting Started: https://go/octagon/
+    MDS Components Library Docs: https://manhattan.gaiacloud.jpmchase.net/get-started/for-developers#web
+    MDS Components Library Overview (has list of components): https://manhattan.gaiacloud.jpmchase.net/doc/components/overview
+
+    If pages contain links, you can use this function again to get the content of the linked pages.
     """
-    Run Playwright in a subprocess to take desktop and mobile screenshots.
-    """
-    script = f"""
-import base64
-import sys
-from pathlib import Path
-from playwright.sync_api import sync_playwright
+    
+    model = getModel()
 
-output = {{}}
+    result = ""
 
-try:
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(viewport={{'width': 1280, 'height': 800}})
-        page.goto("{url}")
-        page.wait_for_timeout(1000)
-        desktop_bytes = page.screenshot(type='png')
-        output['desktop'] = base64.b64encode(desktop_bytes).decode('utf-8')
+        page = browser.new_page()
+        page.goto(url)
+        
+        result = page.content()
 
-        page.set_viewport_size({{'width': 375, 'height': 667}})
-        page.wait_for_timeout(500)
-        mobile_bytes = page.screenshot(type='png')
-        output['mobile'] = base64.b64encode(mobile_bytes).decode('utf-8')
-
+        print(result)
         browser.close()
-except Exception as e:
-    output['errors'] = str(e)
 
-print(repr(output))
-"""
+    response = model.invoke([
+        SystemMessage(content="You will be provided html page content. Convert it to markdown format and return it. Include any links on the page as well as navigation links or tables of contents."),
+        HumanMessage(content=result),
+    ])
 
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write(script)
-        temp_path = f.name
-
-    try:
-        result = subprocess.run(
-            [sys.executable, temp_path],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        if result.returncode == 0:
-            return eval(result.stdout.strip())
-        else:
-            return {"errors": f"Screenshot process failed: {result.stderr}"}
-    except subprocess.TimeoutExpired:
-        return {"errors": "Screenshot capture timed out"}
-    except Exception as e:
-        return {"errors": f"Screenshot capture failed: {str(e)}"}
-    finally:
-        try:
-            os.unlink(temp_path)
-        except:
-            pass
-
-
-def take_screenshots(
-    url: str,
-    *,
-    config: Annotated[RunnableConfig, InjectedToolArg]
-) -> Dict[str, str]:
-    """Take screenshots of the running component in desktop and mobile viewports."""
-    return _take_screenshots_process(url)
-
+    return response.content
 
 def setup_repo_search(repo_path: str) -> None:
     """Set up repository search by initializing the current directory."""
     global _current_search_directory, _repo_root_path
     _repo_root_path = repo_path
     _current_search_directory = repo_path
-
 
 @tool
 def navigate_directory(path: str) -> str:
@@ -406,14 +321,10 @@ def find_controller(path: str, confidence: int, reasoning: str) -> Dict[str, Any
             "error": f"Error processing controller file path: {str(e)}"
         }
 
-
-# Include file navigation tools in the TOOLS list
-TOOLS = [
+RESEARCH_TOOLS = [
     search_docs,
-    compile_component,
-    take_screenshots,
-    navigate_directory,
-    list_directory,
-    read_file,
-    find_controller
+    search_chase_interweb
 ]
+
+if __name__ == "__main__":
+    print(search_chase_interweb("https://go/octagon/"))

@@ -7,19 +7,11 @@ from typing import Annotated, Optional, List
 from pathlib import Path
 
 from langchain_core.runnables import RunnableConfig, ensure_config
-from react_agent import prompts
 
 
 @dataclass(kw_only=True)
 class Configuration:
     """The configuration for the agent."""
-
-    system_prompt: str = field(
-        default=prompts.SYSTEM_PROMPT,
-        metadata={
-            "description": "The system prompt to use for the agent's interactions."
-        },
-    )
 
     model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
         default="anthropic/claude-3-5-sonnet-20240620",

@@ -1,43 +1,47 @@
 """Define a custom React Component Development agent."""
 
 import base64
+import json
+import os
 import shutil
 import traceback
 import zipfile
 from pathlib import Path
 from typing import Literal
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END, START
 
 from react_agent.configuration import Configuration
 from react_agent.state import ComponentMetadata, OutputState, State, InputState, ValidationState
-from react_agent.tools import compile_component, take_screenshots
-from react_agent.utils import extract_code, detect_media_type
+from react_agent.tools import search_docs, RESEARCH_TOOLS
+from react_agent.utils import extract_code, detect_media_type, compile_component, take_screenshots, get_console_errors
 from react_agent.prompts import (
     VALIDATION_SYSTEM_PROMPT,
     REACT_DEVELOPER_SYSTEM_PROMPT,
-    RESEARCH_SYSTEM_PROMPT,
+    RESEARCH_SYSTEM_PROMPT
 )
-from react_agent.models import ValidationResult, ResearchQuestions
-from langchain_anthropic import ChatAnthropic
-from langchain_openai import ChatOpenAI
+from react_agent.models import ValidationResult
+from react_agent.ChaseAzureOpenAI import getModel
+from langgraph.prebuilt import ToolNode
 
 
 def research(state: State, config: RunnableConfig) -> State:
     """Research needed docs from vector db by analyzing designs and requirements."""
-    model = ChatOpenAI(model="gpt-4o")
-    structured_llm = model.with_structured_output(ResearchQuestions)
+    model = getModel()
+    structured_llm = model.bind_tools(RESEARCH_TOOLS)
+
+    if len(state.research_agent_messages) > 0:
+        last_message = state.research_agent_messages[-1]
+    else:
+        last_message = None
     
     # Create message content for GPT-4V analysis
     content = [
         {
             "type": "text",
-            "text": f"""Analyze these design screenshots and requirements to identify key technical aspects that need documentation research:
-
-Requirements:
-{state.requirements}"""
+            "text": f"Requirements:\n{state.requirements}"
         }
     ]
     
@@ -67,20 +71,31 @@ Requirements:
             }
         ])
     
+    metadataValues = {"package_name": []}
+
+    # load metadata file if it exists
+    if os.path.exists("metadata.json"):
+        with open('metadata.json') as json_file:
+            metadataValues = json.load(json_file)
+
+    messages = [
+        SystemMessage(content=RESEARCH_SYSTEM_PROMPT + f"\nAvailable metadata filters: {metadataValues['package_name']}"),
+        *state.research_agent_messages
+    ]
+
+    # add HumanMessage only if last message is not ToolMessage
+    if last_message == None or not isinstance(last_message, ToolMessage):
+        messages.append(HumanMessage(content=content))
+    
     # Get structured analysis and questions from GPT-4V
-    result = structured_llm.invoke([
-        SystemMessage(content=RESEARCH_SYSTEM_PROMPT),
-        HumanMessage(content=content)
-    ])
+    result = structured_llm.invoke(messages)
     
     # Store the analysis and questions
     return State(
         **{
             **state.__dict__,
-            "relevant_docs": [
-                {"analysis": result.design_analysis},
-                {"questions": result.questions}
-            ]
+            "research_agent_messages": [*state.research_agent_messages, HumanMessage(content=content), result],
+            "relevant_docs": result.content
         }
     )
 
@@ -129,7 +144,21 @@ def compile(state: State, config: RunnableConfig) -> State:
             )
 
         if result.get("dev_server_url"):
+            print("Taking screenshots at " + result["dev_server_url"])
+            console_errors = get_console_errors(result["dev_server_url"])
+
+            if console_errors:
+                return State(
+                    **{
+                        **state.__dict__,
+                        "compile_errors": [console_errors]
+                    }
+                )
+
             screenshots = take_screenshots(result["dev_server_url"], config=config)
+            result["server"].stop()
+            print("Stopped server")
+
             return State(
                 **{
                     **state.__dict__,
@@ -151,70 +180,104 @@ def compile(state: State, config: RunnableConfig) -> State:
 
 def validate(state: State, config: RunnableConfig) -> State:
     """Validate the component's appearance against design screenshots."""
+    if state.compile_errors:
+        return State(
+            **{
+                **state.__dict__,
+                "validation": {
+                    "passed": False,
+                    "discrepancies": ["Compile Step Failed with the following errors:\n" + "\n".join(state.compile_errors)],
+                    "matches": []
+                }
+            }
+        )
+    
     if not state.component_screenshots or not state.desktop_design_screenshot:
         return State(
             **{
                 **state.__dict__,
-                "validation": ValidationState(
-                    passed=False,
-                    discrepancies=["Missing screenshots for validation"]
-                )
+                "validation": {
+                    "passed": False, "discrepancies": ["Missing screenshots for validation"]},
+                    "discrepancies": ["Missing screenshots for validation"],
+                    "matches": []
             }
         )
 
-    model = ChatOpenAI(model="gpt-4o", max_completion_tokens=16384)
+    model = getModel()
     structured_llm = model.with_structured_output(ValidationResult)
 
     # Prepare comparison images
     content = [
         {
             "type": "text",
-            "text": f"Compare these images to validate if the implemented component matches the design:\n\nRequirements:\n{state.requirements}"
+            "text": f"Requirements:\n{state.requirements}"
         },
         {
             "type": "text",
-            "text": "Image 1: Original Desktop Design"
-        },
-        {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:{detect_media_type(state.desktop_design_screenshot)};base64,{state.desktop_design_screenshot}",
-                "detail": "high"
-            }
-        },
-        {
-            "type": "text",
-            "text": "Image 2: Implemented Component (Desktop)"
-        },
-        {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:{detect_media_type(state.component_screenshots['desktop'])};base64,{state.component_screenshots['desktop']}",
-                "detail": "high"
-            }
+            "text": "Generated Code:\n" + "\n".join([f"{f['filename']}: {f['content']}" for f in state.generated_code])
         }
     ]
 
-    # Mobile comparison if available
-    if state.mobile_design_screenshot and "mobile" in state.component_screenshots:
+    if state.desktop_design_screenshot:
         content.extend([
-            {"type": "text", "text": "Image 3: Original Mobile Design"},
+            {
+                "type": "text",
+                "text": "\n\nOriginal Desktop Design:"
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{detect_media_type(state.desktop_design_screenshot)};base64,{state.desktop_design_screenshot}",
+                    "detail": "high"
+                }
+            }
+        ])
+
+    if state.mobile_design_screenshot:
+        content.extend([
+            {
+                "type": "text",
+                "text": "\n\nOriginal Mobile Design:"
+            },
             {
                 "type": "image_url",
                 "image_url": {
                     "url": f"data:{detect_media_type(state.mobile_design_screenshot)};base64,{state.mobile_design_screenshot}",
                     "detail": "high"
                 }
-            },
-            {"type": "text", "text": "Image 4: Implemented Component (Mobile)"},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{detect_media_type(state.component_screenshots['mobile'])};base64,{state.component_screenshots['mobile']}",
-                    "detail": "high"
-                }
             }
         ])
+
+    if state.component_screenshots:
+        if "desktop" in state.component_screenshots:
+            content.extend([
+                {
+                    "type": "text",
+                    "text": "\n\nImplemented Component (Desktop):"
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{detect_media_type(state.component_screenshots['desktop'])};base64,{state.component_screenshots['desktop']}",
+                        "detail": "high"
+                    }
+                }
+            ])
+
+        if "mobile" in state.component_screenshots:
+            content.extend([
+                {
+                    "type": "text",
+                    "text": "\n\nImplemented Component (Mobile):"
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{detect_media_type(state.component_screenshots['mobile'])};base64,{state.component_screenshots['mobile']}",
+                        "detail": "high"
+                    }
+                }
+            ])
 
     messages = [
         SystemMessage(content=VALIDATION_SYSTEM_PROMPT),
@@ -226,37 +289,28 @@ def validate(state: State, config: RunnableConfig) -> State:
     return State(
         **{
             **state.__dict__,
-            "validation": ValidationState(
-                passed=result.passed,
-                discrepancies=result.discrepancies,
-                matches=result.matches
-            ),
-            "messages": state.messages + [AIMessage(content=str(result))]
+            "validation": {
+                "passed": result.passed,
+                "discrepancies": result.discrepancies,
+                "matches": result.matches
+            }
         }
     )
 
 
-def should_retry(state: State) -> Literal["retry", "continue", "end"]:
-    """Decide if we need to regenerate code based on errors or failed validation."""
-    if state.parse_error:
-        return "retry" if len(state.messages) < 6 else "end"
-    if state.compile_errors:
-        return "retry" if len(state.messages) < 6 else "end"
-    if state.validation and not state.validation.passed:
-        return "retry" if len(state.messages) < 6 else "end"
-    return "continue"
-
-
 def generate_code(state: State, config: RunnableConfig) -> State:
     """Use the LLM to generate or fix the React component code."""
-    model = ChatOpenAI(model="gpt-4o")
+    model = getModel().bind_tools(RESEARCH_TOOLS)
+
+    if len(state.research_agent_messages) > 0:
+        last_message = state.research_agent_messages[-1]
+    else:
+        last_message = None
 
     # Optional example: show previously discovered doc references or relevant context
     research_context = ""
     if state.relevant_docs:
-        analysis = state.relevant_docs[0].get("analysis", [])
-        if analysis:
-            research_context = "\nTechnical considerations from docs:\n" + "\n".join(f"- {item}" for item in analysis)
+        research_context = f"\nTechnical considerations from docs:\n{state.relevant_docs}"
 
     # Summarize current code or errors
     current_code = ""
@@ -267,18 +321,17 @@ def generate_code(state: State, config: RunnableConfig) -> State:
 
     if state.parse_error:
         prompt = f"The code extraction failed: {state.parse_error}. Please provide valid component code.\n{research_context}\n{current_code}"
-    elif state.compile_errors:
-        prompt = f"The component failed to compile:\n{state.compile_errors}\nPlease fix.\n{research_context}\n{current_code}"
-    elif state.validation and not state.validation.passed:
-        disc = "\n".join([f"- {d}" for d in (state.validation.discrepancies or [])])
-        mts = "\n".join([f"- {m}" for m in (state.validation.matches or [])])
+    elif state.validation and not state.validation['passed']:
+        disc = "\n".join([f"- {d}" for d in (state.validation['discrepancies'] or [])])
+        mts = "\n".join([f"- {m}" for m in (state.validation['matches'] or [])])
         prompt = (
-            f"The component doesn't match the design.\nDISCREPANCIES:\n{disc}\nMATCHES:\n{mts}\n"
+            "Validation Results:\n"
+            f"\nDISCREPANCIES:\n{disc}\nMATCHES:\n{mts}\n"
             f"{research_context}\n{current_code}\nPlease fix it to match the requirements."
         )
     else:
         prompt = (
-            f"Create a React component using Material-UI. It must match the desktop and mobile designs perfectly.\n"
+            f"Create a React component using J.P. Morgan Chase's Octagon React Framework/libraries and their MDS Component Library. It must match the desktop and mobile designs perfectly.\n"
             f"Requirements:\n{state.requirements}\n{research_context}"
         )
 
@@ -334,14 +387,28 @@ def generate_code(state: State, config: RunnableConfig) -> State:
                 }
             }
         ])
-
-    response = model.invoke([
-        SystemMessage(content=REACT_DEVELOPER_SYSTEM_PROMPT),
-        HumanMessage(content=message_content)
-    ])
+    
+    # add HumanMessage only if last message is not ToolMessage
+    if last_message == None or not isinstance(last_message, ToolMessage):
+        response = model.invoke([
+            SystemMessage(content=REACT_DEVELOPER_SYSTEM_PROMPT),
+            *state.messages,
+            HumanMessage(content=message_content)
+        ])
+    else:
+        response = model.invoke([
+            SystemMessage(content=REACT_DEVELOPER_SYSTEM_PROMPT),
+            *state.messages
+        ])
 
     return {
-        "messages": state.messages + [response]
+        "messages": state.messages + [response],
+        "validation": {
+            "passed": False,
+            "discrepancies": [],
+            "matches": []
+        },
+        "compile_errors": [],
     }
 
 
@@ -429,23 +496,101 @@ async def package_component(state: State, config: RunnableConfig) -> State:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def is_research_toolcall(state: State) -> Literal["next", "return_to"]:
+    """Determine the next node based on the model's output.
+
+    This function checks if the model's last message contains tool calls.
+
+    Args:
+        state (State): The current state of the conversation.
+
+    Returns:
+        str: The name of the next node to call ("next" or "return_to").
+    """
+    last_message = state.research_agent_messages[-1]
+    if not isinstance(last_message, AIMessage):
+        raise ValueError(
+            f"Expected AIMessage in output edges, but got {type(last_message).__name__}"
+        )
+    # If there is no tool call, then we finish
+    if not last_message.tool_calls:
+        return "next"
+    # Otherwise we execute the requested actions
+    return "is_tool_call"
+
+def is_generation_toolcall(state: State) -> Literal["next", "return_to"]:
+    """Determine the next node based on the model's output.
+
+    This function checks if the model's last message contains tool calls.
+
+    Args:
+        state (State): The current state of the conversation.
+
+    Returns:
+        str: The name of the next node to call ("next" or "return_to").
+    """
+    last_message = state.messages[-1]
+    if not isinstance(last_message, AIMessage):
+        raise ValueError(
+            f"Expected AIMessage in output edges, but got {type(last_message).__name__}"
+        )
+    # If there is no tool call, then we finish
+    if not last_message.tool_calls:
+        return "next"
+    # Otherwise we execute the requested actions
+    return "is_tool_call"
+
+def should_retry(state: State) -> Literal["retry", "continue", "end"]:
+    """Decide if we need to regenerate code based on errors or failed validation."""
+    if state.parse_error:
+        return "retry" if len(state.messages) < 6 else "end"
+    if state.compile_errors:
+        return "retry" if len(state.messages) < 6 else "end"
+    if state.validation and not state.validation.passed:
+        return "retry" if len(state.messages) < 6 else "end"
+    return "continue"
+
+
 # Define the state graph
 builder = StateGraph(State, input=InputState, config_schema=Configuration)
 
 # Main workflow
 builder.add_node("research", research)
+builder.add_node("research_tools", ToolNode(tools=RESEARCH_TOOLS, messages_key="research_agent_messages"))
 builder.add_node("generate_code", generate_code)
+builder.add_node("generation_tools", ToolNode(tools=RESEARCH_TOOLS))
 builder.add_node("extract", extract)
 builder.add_node("compile", compile)
 builder.add_node("validate", validate)
 builder.add_node("package", package_component)
 
 builder.add_edge(START, "research")
-builder.add_edge("research", "generate_code")
-builder.add_edge("generate_code", "extract")
+builder.add_edge("research_tools", "research")
+
+builder.add_edge("generation_tools", "generate_code")
+
 builder.add_edge("extract", "compile")
 builder.add_edge("compile", "validate")
-builder.add_edge("validate", "package")
+
+builder.add_conditional_edges(
+    "generate_code",
+    is_generation_toolcall,
+    {
+        "next": "extract",
+        "is_tool_call": "generation_tools",
+    }
+)
+
+builder.add_conditional_edges(
+    "research",
+    # After research finishes running, the next node(s) are scheduled
+    # based on the output from route_model_output
+    is_research_toolcall,
+    {
+        "next": "generate_code",
+        "is_tool_call": "research_tools",
+    }
+)
 
 # Retry logic
 builder.add_conditional_edges(
@@ -454,7 +599,7 @@ builder.add_conditional_edges(
     {
         "retry": "generate_code",
         "continue": "package",
-        "end": END
+        "end": END,
     }
 )
 

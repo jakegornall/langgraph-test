@@ -1,13 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
-from dataclasses import field
-
-
-class SearchResult(BaseModel):
-    """Model for documentation search results."""
-    content: str = Field(description="Relevant doc content")
-    source: str = Field(description="Documentation source reference")
-    score: float = Field(description="Relevance score")
+from typing import List
 
 
 class FileItem:
@@ -20,10 +12,24 @@ class FileItem:
 
 class FileContents:
     """Represents the complete structure returned by the extraction step."""
-    dependencies: List[str] = field(default_factory=list)
-    items: List[FileItem] = field(default_factory=list)
+    dependencies: List[str] = Field(default_factory=list)
+    items: List[FileItem] = Field(default_factory=list)
+
+class Chunk(BaseModel):
+    """Structured output for vector chunks."""
+    content: str = Field(
+        description="Content of the chunk"
+    )
+    package_name: str = Field(
+        description="Package name of the chunk (e.g. @octagon/analytics). If the chunk is not part of a package, this will be empty"
+    )
 
 
+class VectorChunks(BaseModel):
+    """Structured output for vector chunks."""
+    chunks: List[Chunk] = Field(
+        description="List of chunks for use in the vector database"
+    )
 
 class ValidationResult(BaseModel):
     """Structured output for design validation."""
@@ -37,12 +43,26 @@ class ValidationResult(BaseModel):
         description="List of elements that match the design perfectly"
     )
 
+class ResearchQuestion(BaseModel):
+    """Structured output for queries."""
+    question: str = Field(
+        description="Specific query to run against doc resources"
+    )
+    filter: str = Field(
+        description="Filter to narrow down the results for better accuracy"
+    )
 
 class ResearchQuestions(BaseModel):
     """Structured output for design analysis and building queries."""
     design_analysis: List[str] = Field(
         description="Key observations about the design"
     )
-    questions: List[str] = Field(
+    questions: List[ResearchQuestion] = Field(
         description="Specific queries to run against doc resources"
+    )
+
+class DependencyList(BaseModel):
+    """Structured output for dependency list."""
+    deps: List[str] = Field(
+        description="List of dependencies"
     )

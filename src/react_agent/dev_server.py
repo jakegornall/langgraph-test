@@ -23,23 +23,47 @@ export default defineConfig({
 })
 """
 
+NPMRC = """registry=https://artifacts.jpmchase.net/artifactory/api/npm/npm/"""
+
+TSCONFIG = {
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "ESNext",
+        "jsx": "react-jsx",
+        "jsxImportSource": "react",
+        "sourceMap": True,
+        "outDir": "dist",
+        "rootDir": "src",
+        "strict": True,
+        "moduleResolution": "node",
+        "esModuleInterop": True,
+        "skipLibCheck": True,
+        "forceConsistentCasingInFileNames": True,
+        "resolveJsonModule": True,
+        "isolatedModules": True,
+        "noEmit": True,
+        "lib": ["ES2022", "DOM"],
+        "paths": {
+            "@/*": ["./src/*"]
+        }
+    },
+    "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.json"],
+    "exclude": ["node_modules", "**/node_modules/*"]
+}
+
 PACKAGE_JSON = {
     "name": "react-component-preview",
     "version": "0.0.0",
     "type": "module",
     "scripts": {
         "dev": "vite",
-        "build": "tsc && vite build",
+        "build": "tsc --noEmit &&vite build",
         "preview": "vite preview"
     },
     "dependencies": {
         "react": "^18.2.0",
         "react-dom": "^18.2.0",
-        "@mui/material": "^5.15.11",
-        "@mui/icons-material": "^5.15.11",
-        "@emotion/react": "^11.11.3",
-        "@emotion/styled": "^11.11.0",
-        "@fontsource/roboto": "^5.0.8"
+        "@mds/web-ui-theme": "^3.2.0",
     },
     "devDependencies": {
         "@types/react": "^18.2.43",
@@ -68,23 +92,16 @@ INDEX_HTML = """
 MAIN_TSX = """
 import React from 'react'
 import { createRoot } from 'react-dom/client'
-import '@fontsource/roboto/300.css';
-import '@fontsource/roboto/400.css';
-import '@fontsource/roboto/500.css';
-import '@fontsource/roboto/700.css';
-import { ThemeProvider, createTheme } from '@mui/material';
-import CssBaseline from '@mui/material/CssBaseline';
+import { Theme } from '@mds/web-ui-theme'; // <-- import the component
+import '@mds/web-ui-theme/cmb';
 import Component from './component'
-
-const theme = createTheme();
 
 const root = createRoot(document.getElementById('root')!);
 root.render(
   <React.StrictMode>
-    <ThemeProvider theme={theme}>
-      <CssBaseline />
+    <Theme>
       <Component />
-    </ThemeProvider>
+    </Theme>
   </React.StrictMode>
 );
 """
@@ -107,20 +124,18 @@ class DevServer:
         except subprocess.CalledProcessError:
             return False
 
-    def _merge_dependencies(self, package_json: dict, dependencies: List[str]) -> dict:
-        """Merge additional dependencies into package.json."""
-        merged = package_json.copy()
-        for dep in dependencies:
-            parts = dep.strip().split('@', 1)
-            name = parts[0].strip()
-            version = parts[1].strip() if len(parts) > 1 else 'latest'
-            merged['dependencies'][name] = version
-        return merged
-
-    def setup(self, files: Dict[str, List[FileItem]], dependencies: List[str] = None) -> None:
+    def setup(self, files: Dict[str, List[FileItem]], dependencies: List[str] = None) -> dict:
         """Set up the development environment with component files and a single project-level list of dependencies."""
         if not self._check_npm_installed():
-            raise RuntimeError("npm is not installed or not found in PATH.")
+            return {
+                "success": False,
+                "message": "npm is not installed or not found in PATH."
+            }
+
+        result = {
+            "success": True,
+            "message": "",
+        }
 
         try:
             # Create temporary directory
@@ -130,23 +145,25 @@ class DevServer:
 
             print(f"Created temporary directory: {self.temp_dir}")
 
-            # Merge additional dependencies if provided
-            merged_package_json = PACKAGE_JSON
-            if dependencies:
-                merged_package_json = self._merge_dependencies(merged_package_json, dependencies)
-
             # Write configuration files
             with open(Path(self.temp_dir) / "package.json", "w", encoding="utf-8") as f:
-                json.dump(merged_package_json, f, indent=2)
+                json.dump(PACKAGE_JSON, f, indent=2)
 
             with open(Path(self.temp_dir) / "vite.config.ts", "w", encoding="utf-8") as f:
                 f.write(VITE_CONFIG)
+            
+            with open(Path(self.temp_dir) / "tsconfig.json", "w", encoding="utf-8") as f:
+                json.dump(TSCONFIG, f, indent=2)
+
+            with open(Path(self.temp_dir) / ".npmrc", "w", encoding="utf-8") as f:
+                f.write(NPMRC)
 
             with open(Path(self.temp_dir) / "index.html", "w", encoding="utf-8") as f:
                 f.write(INDEX_HTML)
 
             with open(src_dir / "main.tsx", "w", encoding="utf-8") as f:
                 f.write(MAIN_TSX)
+
 
             # Write component files
             for file in files["files"]:
@@ -158,30 +175,56 @@ class DevServer:
             # Install dependencies with better error handling
             use_shell = os.name == 'nt'
             try:
-                result = subprocess.run(
+                print(f"npm install in {self.temp_dir}")
+                result_install = subprocess.run(
                     ["npm", "install"],
                     cwd=str(self.temp_dir),
                     check=True,
                     capture_output=True,
                     text=True,
                     shell=use_shell
-                )
-                print(f"npm install stdout: {result.stdout}")
-                print(f"npm install stderr: {result.stderr}")
+                ).stdout.strip()
+                result["message"] += result_install
+
+                # Merge additional dependencies if provided
+                if dependencies:
+                    for dep in dependencies:
+                        print(f"npm install {dep}")
+                        try:
+                            result_dep = subprocess.run(['npm', 'install', dep], check=True, cwd=self.temp_dir, capture_output=True, text=True).stdout.strip()
+                            print(result_dep)
+                            result["message"] += result_dep
+                        except subprocess.CalledProcessError as e:
+                            result["success"] = False
+                            result["message"] += f"\nnpm install failed: {e.stdout.strip()}\n{e.stderr.strip()}"
+                            print(f"npm install failed: {e.stdout.strip()}\n{e.stderr.strip()}")
+                    result['success'] = True
+
             except subprocess.CalledProcessError as e:
-                print(f"npm install failed with exit code {e.returncode}")
-                print(f"stdout: {e.stdout}")
-                print(f"stderr: {e.stderr}")
-                raise RuntimeError(f"npm install failed:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}")
+                result["success"] = False
+                result["message"] += f"\nnpm install failed: {e.stdout.strip()}\n{e.stderr.strip()}"
 
         except Exception as e:
-            if self.temp_dir and Path(self.temp_dir).exists():
-                shutil.rmtree(self.temp_dir)
-            print(f"Setup failed: {str(e)}")
-            print(f"Stack trace: {''.join(traceback.format_tb(e.__traceback__))}")
-            raise RuntimeError(
-                f"Failed to set up development environment:\n{str(e)}\n{''.join(traceback.format_tb(e.__traceback__))}"
-            )
+            result["success"] = False
+            result["message"] += str(e)
+
+        return result
+
+    def build(self) -> str:
+        """Build the development environment."""
+        try:
+            result_build = subprocess.run(["npm", "run", "build"], cwd=self.temp_dir, check=True, capture_output=True, text=True).stdout.strip()
+            print(f"Build result: {result_build}")
+            return {
+                "success": True,
+                "message": result_build
+            }
+        except subprocess.CalledProcessError as e:
+            print(f"Build failed with following error:\nSTDOUT:\n{e.stdout.strip()}\nSTDERR:\n{e.stderr.strip()}")
+            return {
+                "success": False,
+                "message":f"Build failed with following error:\nSTDOUT:\n{e.stdout.strip()}\nSTDERR:\n{e.stderr.strip()}"
+            }
 
     def start(self) -> Dict[str, Any]:
         """Start the development server."""
@@ -197,7 +240,7 @@ class DevServer:
             )
 
             import time
-            time.sleep(2)  # Give the server time to launch
+            time.sleep(2)
 
             if self.process.poll() is not None:
                 stdout, stderr = self.process.communicate()
@@ -229,4 +272,32 @@ class DevServer:
             self.process.wait()
 
         if self.temp_dir and Path(self.temp_dir).exists():
-            shutil.rmtree(self.temp_dir) 
+            shutil.rmtree(self.temp_dir)
+
+
+if __name__ == "__main__":
+    INDEX_TSX = """import React from 'react';
+import { Button } from '@mds/web-ui-button';
+
+const App = () => {
+  return (
+    <div>
+        <Button text="Hello World" />
+    </div>
+  )
+}
+
+export default App;
+"""
+    file_item = FileItem()
+    file_item.filename = "index.tsx"
+    file_item.content = INDEX_TSX
+    file_item.file_type = "tsx"
+    file_item.entrypoint = True
+
+    dev_server = DevServer()
+    dev_server.setup({ "files": [
+        file_item,
+    ] }, dependencies=["@mds/web-ui-theme", "@mds/web-ui-button"])
+    result = dev_server.start()
+    print(result)
