@@ -1462,13 +1462,8 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             for pattern in import_patterns:
                 for match in re.finditer(pattern, content):
                     imported_path = match.group(1)
-                    
-                    # Skip external modules and absolute paths
-                    if (imported_path.startswith('http') or 
-                        imported_path.startswith('/') or 
-                        imported_path.startswith('@angular') or
-                        not '/' in imported_path):
-                        continue
+
+                    logger.info(f"Found Dependency: {imported_path}")
                     
                     # Resolve relative imports
                     full_path = self._resolve_import_path(imported_path, file_path, repo_path)
