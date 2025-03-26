@@ -1602,7 +1602,7 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         # Configure the LLM for structured output
         structured_llm = self.llm.with_structured_output(ReactConversionFiles)
         
-        # Prepare the context for the LLM
+        # Update the system prompt to inform the LLM about the shared folder structure
         system_prompt = """You are an expert at converting legacy web applications to modern React TypeScript applications.
 Your task is to convert view files and their dependencies to React components. CONVERT EVERYTHING! DON'T LEAVE GAPS OR PLACEHOLDERS!
 Your job is to complete the conversion. Developers will not finish your job for you.
@@ -1631,19 +1631,22 @@ Guidelines:
 - remove any jQuery or DOM manipulation and use React best practices instead.
 - if a template uses the sanitizeHtml function, you can import it like this: `import sanitizeHtml from 'sanitize-html';`
 
-Organize files in the following folder structure:
-- components/: Place all React components here (the entrypoint should be directly in this folder)
-- utils/: Place utility functions, helpers, and services here
-- types/: Place TypeScript interfaces, types, and enums here
-- settings/: Place configuration, constants, and default values here
+IMPORTANT - NEW FOLDER STRUCTURE:
+- We are using a centralized structure with shared resources:
+- utils/: For utility functions - shared across all components. If you modify a util file, set is_update=true
+- types/: For TypeScript interfaces - shared across all components. If you modify a type file, set is_update=true
+- settings/: For configuration - shared across all components. If you modify a settings file, set is_update=true
+- components/: For React components specific to each view
 
 For imports:
+- For shared utils/types/settings, use imports like: import { helperFunction } from '../../../utils/helpers';
+- For component-specific imports, use relative paths like: import { SubComponent } from './SubComponent';
 - Convert octagon imports like require('@octagon/<package_name>/*') to ES6 import statements (Shouldn't need to import from dist folders now since the new file will use ES6 imports)
 - retain external library imports like 'common/lib'. Keep the imports in place, but add a TODO for the dev to revisit those.
 - Whenever you see the 'blue/root' library being used, this is just the window object. So instead of using the root object, use window.
 - if you do use the window object, make sure it is compatible with server side rendering by checking if it is defined before using it.
 - Use relative imports for your own files
-- For imports of TypeScript types, specify 'type' explicitly to comply with 'verbatimModuleSyntax'.  For example: "import type { ViewContextType } from '../types/viewContext';"
+- For imports of TypeScript types, specify 'type' explicitly to comply with 'verbatimModuleSyntax'.  For example: "import type { ViewContextType } from '../../../types/viewContext';"
 
 CODE REUSE INSTRUCTIONS:
 - REVIEW the existing generated files to find reusable components, types, utilities, and settings
@@ -1772,6 +1775,7 @@ DEPENDENCIES:
     def save_react_components(self, components: Dict[str, Dict[str, Any]], output_dir: Path) -> Dict[str, Any]:
         """
         Save the generated React components to the specified output directory.
+        Use a centralized folder structure for shared resources.
         
         Args:
             components: Dictionary of component filenames to their content
@@ -1780,11 +1784,12 @@ DEPENDENCIES:
         Returns:
             Dictionary with information about saved files
         """
-        os.makedirs(output_dir, exist_ok=True)
+        # Get the root output directory (parent of all view directories)
+        root_output_dir = output_dir.parents[1]  # Go up two levels to get to the root
         
-        # Create standard directories
+        # Create standard directories at the root level
         for dir_name in ["components", "utils", "types", "settings"]:
-            os.makedirs(output_dir / dir_name, exist_ok=True)
+            os.makedirs(root_output_dir / dir_name, exist_ok=True)
         
         # Save each component
         saved_files = []
@@ -1792,8 +1797,31 @@ DEPENDENCIES:
             if filename == "_explanation" or not component_info.get("content"):
                 continue
             
-            # Determine the full path
-            file_path = output_dir / filename
+            # Determine if this is a shared resource or a component
+            is_shared = any(dirname in filename for dirname in ["utils/", "types/", "settings/"])
+            
+            # For shared resources, save to root level directories
+            if is_shared:
+                # Replace the directory prefix to point to root level
+                parts = filename.split('/')
+                shared_type = parts[0]  # This will be "utils", "types", or "settings"
+                base_name = '/'.join(parts[1:])  # The rest of the path
+                file_path = root_output_dir / shared_type / base_name
+            else:
+                # For components, save under root components directory with view name as subdirectory
+                view_name = output_dir.name
+                controller_name = output_dir.parent.name
+                
+                # If the file is directly in the components directory
+                if filename.startswith("components/"):
+                    component_path = filename.replace("components/", "")
+                    file_path = root_output_dir / "components" / controller_name / view_name / component_path
+                # If it's the main component file directly in the root
+                elif not '/' in filename:
+                    file_path = root_output_dir / "components" / controller_name / view_name / filename
+                else:
+                    # For any other files, maintain their structure under the component directory
+                    file_path = root_output_dir / "components" / controller_name / view_name / filename
             
             # Create any necessary subdirectories
             os.makedirs(file_path.parent, exist_ok=True)
@@ -1804,23 +1832,27 @@ DEPENDENCIES:
 
             if is_update and os.path.exists(file_path):
                 logger.info(f"Updating existing file at {file_path}")
-                # We could implement a smarter merge here if needed
                 # For now, we'll simply overwrite with the new content
+                # In the future, we could implement a smarter merge
+            
+            # Update imports in content to reflect the new file structure
+            # This would be a more complex change requiring import path analysis
+            # For now, we'll store the content as-is, but this could be enhanced later
             
             # Write the file
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
             
             # Update our in-memory record of generated files
-            # Store with a normalized path relative to output_dir
-            rel_path = os.path.relpath(file_path, output_dir)
+            # Store with a normalized path relative to root_output_dir 
+            rel_path = os.path.relpath(file_path, root_output_dir)
             self.generated_files[rel_path] = content
             
             saved_files.append(str(file_path))
             logger.info(f"Saved component to {file_path}")
         
         return {
-            "output_dir": str(output_dir),
+            "output_dir": str(root_output_dir),
             "saved_files": saved_files,
             "file_count": len(saved_files)
         }
@@ -1853,9 +1885,6 @@ DEPENDENCIES:
         # From controller_to_component_map, create a reciprocal component_to_controller map.
         component_to_controller_map = self._build_component_to_controller_map(controller_to_component_map)
         
-        # Find identified controller files
-        # controller_files = self.find_defined_controller_files(controller_keys, repo_path)
-
         # Find all view files
         view_files = self.find_all_view_files(repo_path)
 
@@ -1865,12 +1894,15 @@ DEPENDENCIES:
         
         # Create output directory for React components
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        subdir_name =repo_url.split("/")[-1].removesuffix(".git")
+        subdir_name = repo_url.split("/")[-1].removesuffix(".git")
         output_base_dir = Path(f"converted_views_{timestamp}")
-        code_base_dir = output_base_dir.joinpath(subdir_name)
-        output_base_dir = Path(f"converted_controllers_{timestamp}")
         os.makedirs(output_base_dir, exist_ok=True)
+        
+        # Create standard directories at the root level
+        for dir_name in ["components", "utils", "types", "settings"]:
+            os.makedirs(output_base_dir / dir_name, exist_ok=True)
 
+        # Create Octagon app in the output directory
         create_octagon_result = subprocess.run(
             [
                 "npx", 
@@ -1892,7 +1924,7 @@ DEPENDENCIES:
                 "--uiVariation=none",
                 "--utilities=none",
                 "--video=none",
-              ],
+            ],
             check=True,
             capture_output=True,
         )
@@ -1929,23 +1961,21 @@ DEPENDENCIES:
         current_view_file_counter = 0
         for view_file in view_files:
             try:
-                logger.info(f"Processing view file: {view_file}")
-                # Create a specific output directory for this view
-                view_name = os.path.splitext(os.path.basename(view_file))[0]
+                # Increment counter and log progress
                 current_view_file_counter += 1
                 logger.info(f"Processing view file {current_view_file_counter}/{len(view_files)}: {view_file}")
                 view_name = os.path.splitext(os.path.basename(view_file))[0]
                 
                 # Find parent controller
                 parent_controller = "no_controller" # Assume the worst
-
                 if component_to_controller_map is not None:
                     # But hope for the best
                     parent_controller = component_to_controller_map[view_name] if view_name in component_to_controller_map else "no_controller"
 
-                # Create a specific output directory for this view
-                view_name = os.path.splitext(os.path.basename(view_file))[0]
+                # Create a temporary target directory for this view's output
+                # The actual files will be reorganized by save_react_components
                 output_dir = output_base_dir / parent_controller / view_name
+                os.makedirs(output_dir, exist_ok=True)
                 
                 # Analyze dependencies for this view
                 dependencies = self.analyze_view_dependencies(view_file, repo_path)
