@@ -1754,11 +1754,11 @@ DEPENDENCIES:
             
             # Convert the structured output to our standard format
             result = {
-                "components": {}
+                "files": {}
             }
             
             for file in response.files:
-                result["components"][file.filename] = {
+                result["files"][file.filename] = {
                     "content": file.content,
                     "is_update": file.is_update
                 }
@@ -1962,20 +1962,20 @@ DEPENDENCIES:
                         logger.error(f"Error reading dependent file {dep_file}: {str(e)}")
                 
                 # Convert to React using LLM
-                react_components = self._convert_to_react(view_file, dependent_files_content)
+                generated_files = self._convert_to_react(view_file, dependent_files_content)
                 
                 # Save the React components
-                if "components" in react_components:
-                    save_result = self.save_react_components(react_components["components"], output_dir)
+                if "files" in generated_files:
+                    save_result = self.save_react_components(generated_files["files"], output_dir)
                     generated_file_count += save_result["file_count"]
-                    react_components["save_result"] = save_result
+                    generated_files["save_result"] = save_result
                 
                 # Store results
                 relative_view_path = os.path.relpath(view_file, repo_path)
                 conversion_results[relative_view_path] = {
                     "original_view": str(view_file),
                     "dependencies": [str(dep) for dep in dependencies],
-                    "react_components": react_components,
+                    "generated_files": generated_files,
                     "output_dir": str(output_dir)
                 }
                 
