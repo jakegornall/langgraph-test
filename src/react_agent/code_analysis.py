@@ -61,6 +61,15 @@ class CodeAnalyzer:
         self.start_time = None
         # For caching large responses
         self.analysis_cache = {}
+        # Track converted files to enable reuse
+        self.converted_files = {
+            "components": {},  # Maps source file path -> generated component files
+            "utils": {},       # Maps utility name -> generated utility file path
+            "settings": {},    # Maps settings name -> generated settings file path
+            "types": {},       # Maps type name -> generated type file path
+        }
+        # The single output directory for the entire project
+        self.project_output_dir = None
             
     def _parse_screen_id(self, screen_id: str) -> Tuple[str, str, str, str]:
         """Parse the screen ID into its components."""
@@ -1571,13 +1580,14 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         except Exception as e:
             logger.error(f"Error analyzing dependencies for {file_path}: {str(e)}")
 
-    def _convert_to_react(self, view_file: Path, dependent_files_content: Dict[str, str]) -> Dict[str, Any]:
+    def _convert_to_react(self, view_file: Path, dependent_files_content: Dict[str, str], view_component_dir: Path) -> Dict[str, Any]:
         """
         Use LLM to convert a view file and its dependencies to React components with structured output.
         
         Args:
             view_file: Path to the view file
             dependent_files_content: Dictionary mapping file paths to their content
+            view_component_dir: Path where the main component should be placed
             
         Returns:
             Dictionary containing React components
@@ -1592,6 +1602,8 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         class File(BaseModel):
             filename: str = Field(description="Filename for the component (e.g., 'Component.tsx', 'utils/helpers.ts')")
             content: str = Field(description="Complete source code for the component")
+            category: str = Field(description="Category of file: 'component', 'util', 'type', or 'setting'")
+            reuse_existing: bool = Field(description="Whether to reuse an existing file instead of creating a new one", default=False)
         
         class ReactConversionFiles(BaseModel):
             files: List[File] = Field(description="List of React component files")
@@ -1599,16 +1611,19 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         # Configure the LLM for structured output
         structured_llm = self.llm.with_structured_output(ReactConversionFiles)
         
+        # Prepare the context for previously converted files
+        previously_converted_context = self._get_previously_converted_context()
+        
         # Prepare the context for the LLM
-        system_prompt = """You are an expert at converting legacy web applications to modern React TypeScript applications.
+        system_prompt = f"""You are an expert at converting legacy web applications to modern React TypeScript applications.
 Your task is to convert view files and their dependencies to React components. CONVERT EVERYTHING! DON'T LEAVE GAPS OR PLACEHOLDERS!
 Your job is to complete the conversion. Developers will not finish your job for you.
 
 DO NOT DO THINGS LIKE THIS (You should actually write the complete code):
   return (
     <div>
-      {/* Render template and partials */}
-      {/* Example: <StepOne {...viewContext} /> */}
+      {{/* Render template and partials */}}
+      {{/* Example: <StepOne {{...viewContext}} /> */}}
     </div>
   );
 
@@ -1628,6 +1643,17 @@ Guidelines:
 - remove any jQuery or DOM manipulation and use React best practices instead.
 - if a template uses the sanitizeHtml function, you can import it like this: `import sanitizeHtml from 'sanitize-html';`
 
+IMPORTANT: REUSE EXISTING FILES
+This project already has some previously converted React files. You should:
+1. Review the previously converted files listed below
+2. REUSE these files when possible instead of creating duplicate implementations
+3. Use relative imports to reference these existing files
+4. Only create new utility, settings, or type files if you need functionality not available in existing files
+5. For each file you create, specify if it should be a new file or reuse an existing one
+6. Mark files for reuse by setting reuse_existing=true and provide the same filename as an existing file
+
+{previously_converted_context}
+
 Organize files in the following folder structure:
 - components/: Place all React components here (the entrypoint should be directly in this folder)
 - utils/: Place utility functions, helpers, and services here
@@ -1640,7 +1666,7 @@ For imports:
 - Whenever you see the 'blue/root' library being used, this is just the window object. So instead of using the root object, use window.
 - if you do use the window object, make sure it is compatible with server side rendering by checking if it is defined before using it.
 - Use relative imports for your own files
-- For imports of TypeScript types, specify 'type' explicitly to comply with 'verbatimModuleSyntax'.  For example: "import type { ViewContextType } from '../types/viewContext';"
+- For imports of TypeScript types, specify 'type' explicitly to comply with 'verbatimModuleSyntax'.  For example: "import type {{ ViewContextType }} from '../types/viewContext';"
 
 Example of MDS conversion:
 <mds-text-input 
@@ -1648,38 +1674,49 @@ Example of MDS conversion:
     id="totalMonthlyPayments"
     fieldName="totalMonthlyPayments"
     on-blur="validateAndFormat"
-    label={{~/totalMonthlyPaymentsLabel}}
-    placeholder={{~/amountPlaceholder}}
+    label={{{{~/totalMonthlyPaymentsLabel}}}}
+    placeholder={{{{~/amountPlaceholder}}}}
     on-change="formFieldTracking"
     validate="['required', 'noSpecialCharacters', 'currency', 'positiveNumber', 'noDecimals', 'lessThanOrEqualToMaxNumber', 'greaterThanOrEqualToMinNumber']"
-    validate-max="{{.maximumInputAmount}}"
-    validate-min="{{.minimumInputAmount}}"
+    validate-max="{{{{.maximumInputAmount}}}}"
+    validate-min="{{{{.minimumInputAmount}}}}"
     error-key="affordabilityCalculatorQuestionErrorHeader"
     name="totalMonthlyPayments"
-    microcopy="{{~/totalMonthlyPaymentsAdvisory}}"
-    value="{{sanitize.sanitizeHtml(~/totalMonthlyPayments)}}"
+    microcopy="{{{{~/totalMonthlyPaymentsAdvisory}}}}"
+    value="{{{{sanitize.sanitizeHtml(~/totalMonthlyPayments)}}}}"
 >
 </mds-text-input>
 
 Becomes:
-import { MdsTextInput } from '@mds/react';
+import {{ MdsTextInput }} from '@mds/react';
 import sanitizeHtml from 'sanitize-html';
 
 <MdsTextInput
     name="totalMonthlyPayments"
     id="totalMonthlyPayments"
     fieldName="totalMonthlyPayments"
-    onBlur={validateAndFormat}
-    label={totalMonthlyPaymentsLabel}
-    placeholder={amountPlaceholder}
-    onChange={formFieldTracking}
-    validate={['required', 'noSpecialCharacters', 'currency', 'positiveNumber', 'noDecimals', 'lessThanOrEqualToMaxNumber', 'greaterThanOrEqualToMinNumber']}
-    validateMax={maximumInputAmount}
-    validateMin={minimumInputAmount}
+    onBlur={{validateAndFormat}}
+    label={{totalMonthlyPaymentsLabel}}
+    placeholder={{amountPlaceholder}}
+    onChange={{formFieldTracking}}
+    validate={{['required', 'noSpecialCharacters', 'currency', 'positiveNumber', 'noDecimals', 'lessThanOrEqualToMaxNumber', 'greaterThanOrEqualToMinNumber']}}
+    validateMax={{maximumInputAmount}}
+    validateMin={{minimumInputAmount}}
     errorKey="affordabilityCalculatorQuestionErrorHeader"
-    microcopy={totalMonthlyPaymentsAdvisory}
-    value={sanitizeHtml(totalMonthlyPayments)}
+    microcopy={{totalMonthlyPaymentsAdvisory}}
+    value={{sanitizeHtml(totalMonthlyPayments)}}
 />
+
+IMPORTANT: UPDATING EXISTING FILES
+When you encounter functionality that should be added to an existing file:
+1. Set reuse_existing=true for that file
+2. Include the complete updated file content, not just the new additions
+3. Your updated content should intelligently merge with the existing file
+4. For utils, types, and shared components, always check if they already exist before creating new ones
+5. When adding new functions to existing files, maintain the same style and patterns
+
+For example, if you need to add a formatDate function and there's already a utils/dateUtils.ts file,
+add your function to that file rather than creating a new one.
 """
         
         # Find the relative view path
@@ -1722,7 +1759,6 @@ DEPENDENCIES:
             response = None
             
             with get_openai_callback() as cb:
-
                 # Approximate the size of the messages in tokens by counting every 4 characters
                 messages_size = sum(len(message.content) for message in messages)
                 messages_size = int(messages_size / 4)
@@ -1732,7 +1768,7 @@ DEPENDENCIES:
                 logger.info(f"Prompt Tokens: {cb.prompt_tokens}")
                 logger.info(f"Completion Tokens: {cb.completion_tokens}")
             
-            # Convert the structured output to our standard format
+            # Convert the structured output to our standard format and update the conversion registry
             result = {
                 "components": {}
             }
@@ -1740,7 +1776,19 @@ DEPENDENCIES:
             for file in response.files:
                 result["components"][file.filename] = {
                     "content": file.content,
+                    "category": file.category,
+                    "reuse_existing": file.reuse_existing
                 }
+                
+                # If not reusing, add to our conversion registry
+                if not file.reuse_existing:
+                    category_key = file.category + "s"  # e.g., "component" -> "components"
+                    if category_key in self.converted_files:
+                        # Add original files that lead to this conversion as source
+                        self.converted_files[category_key][file.filename] = {
+                            "content": file.content,
+                            "source_files": [str(view_file)] + list(dependent_files_content.keys())
+                        }
                 
             return result
             
@@ -1748,46 +1796,100 @@ DEPENDENCIES:
             logger.error(f"Error converting {view_file} to React: {str(e)}")
             return {"error": str(e)}
 
-    def save_react_components(self, components: Dict[str, Dict[str, Any]], output_dir: Path) -> Dict[str, Any]:
+    def save_react_components(self, components: Dict[str, Dict[str, Any]], source_view_file: Path) -> Dict[str, Any]:
         """
-        Save the generated React components to the specified output directory.
+        Save the generated React components to the appropriate directories or update existing files.
         
         Args:
-            components: Dictionary of component filenames to their content
-            output_dir: Path to the output directory
+            components: Dictionary of component filenames to their info (content, category, reuse_existing)
+            source_view_file: The original view file that was converted
             
         Returns:
             Dictionary with information about saved files
         """
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create standard directories
-        for dir_name in ["components", "utils", "types", "settings"]:
-            os.makedirs(output_dir / dir_name, exist_ok=True)
+        if not self.project_output_dir:
+            raise ValueError("Project output directory not set")
         
         # Save each component
         saved_files = []
+        reused_files = []
+        updated_files = []
+        
         for filename, component_info in components.items():
             if filename == "_explanation" or not component_info.get("content"):
                 continue
             
-            # Determine the full path
-            file_path = output_dir / filename
+            # Determine the full path based on file category
+            category = component_info.get("category", "component")
+            
+            if category == "component":
+                # Components go directly in the components folder or in controller-specific subfolders
+                file_path = self.project_output_dir / filename
+            else:
+                # Utils, types, and settings go in their respective folders
+                category_folder = f"{category}s"  # e.g., "util" -> "utils"
+                if category_folder not in ["utils", "types", "settings"]:
+                    category_folder = "utils"  # Default to utils if unknown
+                    
+                file_path = self.project_output_dir / category_folder / os.path.basename(filename)
             
             # Create any necessary subdirectories
             os.makedirs(file_path.parent, exist_ok=True)
             
-            # Write the file
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(component_info["content"])
+            # Check if file exists and needs updating
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    existing_content = f.read()
+                
+                if component_info.get("reuse_existing", False):
+                    # If marked for reuse but content differs, we should update the file
+                    if existing_content.strip() != component_info["content"].strip():
+                        merged_content = self._merge_file_contents(existing_content, component_info["content"], filename)
+                        
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.write(merged_content)
+                        
+                        updated_files.append(str(file_path))
+                        logger.info(f"Updated existing file: {file_path}")
+                    else:
+                        reused_files.append(str(file_path))
+                        logger.info(f"Reusing existing file without changes: {file_path}")
+                else:
+                    # Not marked for reuse, but file exists - we'll update it with new content
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(component_info["content"])
+                    updated_files.append(str(file_path))
+                    logger.info(f"Replaced existing file: {file_path}")
+            else:
+                # File doesn't exist, create it
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(component_info["content"])
+                
+                saved_files.append(str(file_path))
+                logger.info(f"Saved {category} to {file_path}")
             
-            saved_files.append(str(file_path))
-            logger.info(f"Saved component to {file_path}")
+            # Add to our conversion registry if not already there or update existing entry
+            category_key = f"{category}s"
+            if category_key in self.converted_files:
+                # If file already exists in registry, update the content
+                if filename in self.converted_files[category_key]:
+                    self.converted_files[category_key][filename]["content"] = component_info["content"]
+                    # Add this source file to the list if not already there
+                    if str(source_view_file) not in self.converted_files[category_key][filename]["source_files"]:
+                        self.converted_files[category_key][filename]["source_files"].append(str(source_view_file))
+                else:
+                    # Add new entry to registry
+                    self.converted_files[category_key][filename] = {
+                        "content": component_info["content"],
+                        "source_files": [str(source_view_file)]
+                    }
         
         return {
-            "output_dir": str(output_dir),
+            "output_dir": str(self.project_output_dir),
             "saved_files": saved_files,
-            "file_count": len(saved_files)
+            "reused_files": reused_files,
+            "updated_files": updated_files,
+            "file_count": len(saved_files) + len(updated_files)
         }
 
     def convert_views_to_react(self, repo_url: str) -> Dict[str, Any]:
@@ -1815,9 +1917,6 @@ DEPENDENCIES:
         # From controller_to_component_map, create a reciprocal component_to_controller map.
         component_to_controller_map = self._build_component_to_controller_map(controller_to_component_map)
         
-        # Find identified controller files
-        # controller_files = self.find_defined_controller_files(controller_keys, repo_path)
-
         # Find all view files
         view_files = self.find_all_view_files(repo_path)
 
@@ -1825,13 +1924,12 @@ DEPENDENCIES:
         self._parse_config_files(repo_path)
         logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
         
-        # Create output directory for React components
+        # Create output directory for React components - ONE directory for the entire project
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        subdir_name =repo_url.split("/")[-1].removesuffix(".git")
+        subdir_name = repo_url.split("/")[-1].removesuffix(".git")
         output_base_dir = Path(f"converted_views_{timestamp}")
-        code_base_dir = output_base_dir.joinpath(subdir_name)
-        output_base_dir = Path(f"converted_controllers_{timestamp}")
-        os.makedirs(output_base_dir, exist_ok=True)
+        self.project_output_dir = output_base_dir.joinpath(subdir_name)
+        os.makedirs(self.project_output_dir, exist_ok=True)
 
         create_octagon_result = subprocess.run(
             [
@@ -1885,29 +1983,32 @@ DEPENDENCIES:
         if add_cxo_common_result.stdout:
             logger.info(f"Added common dependencies: {add_cxo_common_result.stdout.decode('utf-8')}")
 
+        # Create standard directories in the project output directory
+        for dir_name in ["components", "utils", "types", "settings"]:
+            os.makedirs(self.project_output_dir / dir_name, exist_ok=True)
+
         # Process each view file
         conversion_results = {}
         generated_file_count = 0
         current_view_file_counter = 0
-        for view_file in view_files:
+        
+        # Sort view files by how frequently they're depended on to convert shared utilities first
+        view_files_with_scores = self._score_view_files_by_dependencies(view_files, repo_path)
+        
+        for view_file, _ in view_files_with_scores:
             try:
-                logger.info(f"Processing view file: {view_file}")
-                # Create a specific output directory for this view
-                view_name = os.path.splitext(os.path.basename(view_file))[0]
                 current_view_file_counter += 1
                 logger.info(f"Processing view file {current_view_file_counter}/{len(view_files)}: {view_file}")
                 view_name = os.path.splitext(os.path.basename(view_file))[0]
                 
                 # Find parent controller
-                parent_controller = "no_controller" # Assume the worst
-
+                parent_controller = "no_controller"
                 if component_to_controller_map is not None:
-                    # But hope for the best
-                    parent_controller = component_to_controller_map[view_name] if view_name in component_to_controller_map else "no_controller"
-
-                # Create a specific output directory for this view
-                view_name = os.path.splitext(os.path.basename(view_file))[0]
-                output_dir = output_base_dir / parent_controller / view_name
+                    parent_controller = component_to_controller_map.get(view_name, "no_controller")
+                
+                # Set target directory for this view's main component
+                view_component_dir = self.project_output_dir / "components" / parent_controller / view_name
+                os.makedirs(view_component_dir, exist_ok=True)
                 
                 # Analyze dependencies for this view
                 dependencies = self.analyze_view_dependencies(view_file, repo_path)
@@ -1923,14 +2024,18 @@ DEPENDENCIES:
                     except Exception as e:
                         logger.error(f"Error reading dependent file {dep_file}: {str(e)}")
                 
-                # Convert to React using LLM
-                react_components = self._convert_to_react(view_file, dependent_files_content)
+                # Convert to React using LLM with context about already converted files
+                react_components = self._convert_to_react(view_file, dependent_files_content, view_component_dir)
                 
                 # Save the React components
                 if "components" in react_components:
-                    save_result = self.save_react_components(react_components["components"], output_dir)
+                    save_result = self.save_react_components(react_components["components"], view_file)
                     generated_file_count += save_result["file_count"]
                     react_components["save_result"] = save_result
+                    
+                    # Log information about file updates
+                    if save_result.get("updated_files"):
+                        logger.info(f"Updated {len(save_result['updated_files'])} existing files")
                 
                 # Store results
                 relative_view_path = os.path.relpath(view_file, repo_path)
@@ -1938,7 +2043,7 @@ DEPENDENCIES:
                     "original_view": str(view_file),
                     "dependencies": [str(dep) for dep in dependencies],
                     "react_components": react_components,
-                    "output_dir": str(output_dir)
+                    "output_dir": str(view_component_dir)
                 }
                 
             except Exception as e:
@@ -1956,8 +2061,169 @@ DEPENDENCIES:
             "generated_file_count": generated_file_count,
             "analysis_time_seconds": elapsed_time,
             "controller_to_component_map": controller_to_component_map,
-            "output_base_dir": str(output_base_dir)
+            "output_base_dir": str(output_base_dir),
+            "reused_file_count": self._count_reused_files(),
+            "updated_file_count": sum(
+                len(result.get("react_components", {}).get("save_result", {}).get("updated_files", []))
+                for result in conversion_results.values()
+                if isinstance(result, dict) and "react_components" in result
+            )
         }
+
+    def _score_view_files_by_dependencies(self, view_files, repo_path):
+        """
+        Score view files based on how often they're depended on, to prioritize shared utilities.
+        
+        Args:
+            view_files: List of view file paths
+            repo_path: Path to repository
+            
+        Returns:
+            List of (view_file, score) tuples sorted by score (highest first)
+        """
+        dependency_counts = {}
+        file_dependency_map = {}
+        
+        # First, collect all dependencies for each view file
+        for view_file in view_files:
+            deps = self.analyze_view_dependencies(view_file, repo_path)
+            file_dependency_map[view_file] = deps
+            
+            # Count how many times each file is depended on
+            for dep in deps:
+                if dep not in dependency_counts:
+                    dependency_counts[dep] = 0
+                dependency_counts[dep] += 1
+        
+        # Now score each view file based on how many times its dependencies are used elsewhere
+        scored_files = []
+        for view_file in view_files:
+            # Base score for the file itself
+            score = dependency_counts.get(view_file, 0)
+            
+            # Add scores for its dependencies
+            for dep in file_dependency_map.get(view_file, []):
+                score += dependency_counts.get(dep, 0)
+            
+            scored_files.append((view_file, score))
+        
+        # Sort by score, highest first
+        return sorted(scored_files, key=lambda x: x[1], reverse=True)
+
+    def _count_reused_files(self):
+        """Count how many files were reused instead of regenerated."""
+        reuse_count = 0
+        for category in self.converted_files.values():
+            reuse_count += len(category)
+        return reuse_count
+
+    def _get_previously_converted_context(self) -> str:
+        """
+        Create a context string describing previously converted files.
+        
+        Returns:
+            String describing previously converted files to include in the prompt
+        """
+        context_parts = ["PREVIOUSLY CONVERTED FILES:"]
+        
+        # List converted utilities
+        if self.converted_files["utils"]:
+            context_parts.append("\nUTILITY FILES:")
+            for filename, file_info in self.converted_files["utils"].items():
+                # Get a short preview of the file
+                content = file_info["content"]
+                preview = content[:500] + "..." if len(content) > 500 else content
+                context_parts.append(f"\nFile: {filename}\n```typescript\n{preview}\n```")
+        
+        # List converted types
+        if self.converted_files["types"]:
+            context_parts.append("\nTYPE FILES:")
+            for filename, file_info in self.converted_files["types"].items():
+                content = file_info["content"]
+                preview = content[:500] + "..." if len(content) > 500 else content
+                context_parts.append(f"\nFile: {filename}\n```typescript\n{preview}\n```")
+        
+        # List converted settings
+        if self.converted_files["settings"]:
+            context_parts.append("\nSETTINGS FILES:")
+            for filename, file_info in self.converted_files["settings"].items():
+                content = file_info["content"]
+                preview = content[:500] + "..." if len(content) > 500 else content
+                context_parts.append(f"\nFile: {filename}\n```typescript\n{preview}\n```")
+        
+        # List a few key components that might be reusable
+        if self.converted_files["components"]:
+            context_parts.append("\nKEY COMPONENT FILES:")
+            # Only include a few component files to avoid prompt size issues
+            component_count = 0
+            for filename, file_info in self.converted_files["components"].items():
+                if component_count >= 5:  # Limit to 5 components
+                    break
+                
+                # Only include smaller components that are likely to be reusable
+                content = file_info["content"]
+                if "type Props" in content or "interface Props" in content:
+                    preview = content[:500] + "..." if len(content) > 500 else content
+                    context_parts.append(f"\nFile: {filename}\n```typescript\n{preview}\n```")
+                    component_count += 1
+        
+        if len(context_parts) == 1:
+            return "No previously converted files yet."
+        
+        return "\n".join(context_parts)
+
+    def _merge_file_contents(self, existing_content: str, new_content: str, filename: str) -> str:
+        """
+        Merge existing file content with new content, preserving manual edits.
+        
+        Args:
+            existing_content: Content of existing file
+            new_content: Generated new content 
+            filename: Name of the file being merged
+            
+        Returns:
+            Merged content
+        """
+        # For TypeScript/JavaScript files, use more intelligent merging
+        if filename.endswith(('.ts', '.tsx', '.js', '.jsx')):
+            try:
+                # Use the LLM to help with merging
+                merge_prompt = f"""
+                I need to merge an existing file with newly generated content.
+                
+                EXISTING FILE:
+                ```
+                {existing_content}
+                ```
+                
+                NEW CONTENT TO MERGE:
+                ```
+                {new_content}
+                ```
+                
+                Please merge these files intelligently:
+                1. Keep all imports from both files (deduplicated)
+                2. Merge interface/type definitions, adding new fields from the new content
+                3. Keep all existing functions, but update any that have the same name in the new content
+                4. Add any completely new functions from the new content
+                
+                Return ONLY the merged content without any explanations.
+                """
+                merged_content = self.llm.invoke([HumanMessage(content=merge_prompt)]).content
+                
+                # Clean up any markdown formatting
+                merged_content = re.sub(r'^```(?:jsx|javascript|typescript|tsx|react)?\s*', '', merged_content, flags=re.MULTILINE)
+                merged_content = re.sub(r'\s*```$', '', merged_content, flags=re.MULTILINE)
+                
+                logger.info(f"Intelligently merged file: {filename}")
+                return merged_content
+            except Exception as e:
+                logger.error(f"Error merging file {filename}: {e}")
+                # Fall back to new content if merging fails
+                return new_content
+        else:
+            # For other file types, use the new content
+            return new_content
 
 
 def convert_blueJS_repo(repo_url: str) -> Dict[str, Any]:
