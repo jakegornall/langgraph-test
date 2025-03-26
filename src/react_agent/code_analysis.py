@@ -61,6 +61,8 @@ class CodeAnalyzer:
         self.start_time = None
         # For caching large responses
         self.analysis_cache = {}
+        # Store all generated files for context accumulation
+        self.generated_files = {}
             
     def _parse_screen_id(self, screen_id: str) -> Tuple[str, str, str, str]:
         """Parse the screen ID into its components."""
@@ -1592,6 +1594,7 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         class File(BaseModel):
             filename: str = Field(description="Filename for the component (e.g., 'Component.tsx', 'utils/helpers.ts')")
             content: str = Field(description="Complete source code for the component")
+            is_update: bool = Field(description="Whether this is updating an existing file")
         
         class ReactConversionFiles(BaseModel):
             files: List[File] = Field(description="List of React component files")
@@ -1641,6 +1644,13 @@ For imports:
 - if you do use the window object, make sure it is compatible with server side rendering by checking if it is defined before using it.
 - Use relative imports for your own files
 - For imports of TypeScript types, specify 'type' explicitly to comply with 'verbatimModuleSyntax'.  For example: "import type { ViewContextType } from '../types/viewContext';"
+
+CODE REUSE INSTRUCTIONS:
+- REVIEW the existing generated files to find reusable components, types, utilities, and settings
+- REUSE existing code wherever possible instead of writing duplicates
+- UPDATE existing utility or setting files by adding new functions or values if appropriate
+- ADD new exports to existing type files rather than creating new ones for similar types
+- If you need to UPDATE an existing file, set is_update=true in your response
 
 Example of MDS conversion:
 <mds-text-input 
@@ -1710,6 +1720,16 @@ DEPENDENCIES:
             if file_path != view_file_str and file_path != os.path.basename(view_file):
                 user_prompt += f"\nFile: {file_path}\n```\n{content}\n```"
         
+        # Add previously generated files to the prompt for context and potential reuse
+        if self.generated_files:
+            user_prompt += "\n\nPREVIOUSLY GENERATED FILES (REUSE WHERE APPROPRIATE):\n"
+            # Sort files by type to present them in a logical order
+            sorted_files = sorted(self.generated_files.items(), 
+                                  key=lambda x: ("types" in x[0], "utils" in x[0], "settings" in x[0], "components" in x[0], x[0]))
+            
+            for file_path, content in sorted_files:
+                user_prompt += f"\nFile: {file_path}\n```\n{content}\n```"
+        
         # Call LLM to convert to React with structured output
         try:
             from langchain_core.messages import SystemMessage, HumanMessage
@@ -1740,6 +1760,7 @@ DEPENDENCIES:
             for file in response.files:
                 result["components"][file.filename] = {
                     "content": file.content,
+                    "is_update": file.is_update
                 }
                 
             return result
@@ -1777,9 +1798,23 @@ DEPENDENCIES:
             # Create any necessary subdirectories
             os.makedirs(file_path.parent, exist_ok=True)
             
+            # Special handling for updates to existing files
+            is_update = component_info.get("is_update", False)
+            content = component_info["content"]
+
+            if is_update and os.path.exists(file_path):
+                logger.info(f"Updating existing file at {file_path}")
+                # We could implement a smarter merge here if needed
+                # For now, we'll simply overwrite with the new content
+            
             # Write the file
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(component_info["content"])
+                f.write(content)
+            
+            # Update our in-memory record of generated files
+            # Store with a normalized path relative to output_dir
+            rel_path = os.path.relpath(file_path, output_dir)
+            self.generated_files[rel_path] = content
             
             saved_files.append(str(file_path))
             logger.info(f"Saved component to {file_path}")
@@ -1802,6 +1837,9 @@ DEPENDENCIES:
         """
         logger.info(f"Starting view-to-React conversion for {repo_url}")
         self.start_time = time.time()
+        
+        # Reset the generated files dictionary at the start of a new conversion
+        self.generated_files = {}
 
         # Ensure the repository storage directory exists
         os.makedirs(REPO_STORAGE_DIR, exist_ok=True)
@@ -1956,7 +1994,8 @@ DEPENDENCIES:
             "generated_file_count": generated_file_count,
             "analysis_time_seconds": elapsed_time,
             "controller_to_component_map": controller_to_component_map,
-            "output_base_dir": str(output_base_dir)
+            "output_base_dir": str(output_base_dir),
+            "generated_files": self.generated_files  # Include the full set of generated files
         }
 
 
