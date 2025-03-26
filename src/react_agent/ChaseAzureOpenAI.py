@@ -1,6 +1,6 @@
 from langchain_openai import AzureChatOpenAI
 import os
-import datetime
+from datetime import datetime, timedelta, timezone
 import base64
 import binascii
 import jwt
@@ -9,12 +9,13 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography import x509
 import requests
 from dotenv import load_dotenv
+from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
 load_dotenv()
 
-cert_path = "./OctagonAI-ServicePrincipal.pem"
-root_ca_path = "./JPMCROOTCA.pem"
+cert_path = os.path.realpath('./OctagonAI-ServicePrincipal.pem')
+root_ca_path = os.path.realpath('./JPMCROOTCA.pem')
 
 # Proxies
 JPMC_PROXY = {
@@ -41,9 +42,9 @@ def encode_jwt(tenant_id, client_id, cert_thumbprint, private_key):
         "aud": f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
         "iss": client_id,
         "sub": client_id,
-        "jti": datetime.datetime.now(tz=datetime.timezone.utc).strftime('%Y%m%d%H%M%S%f'),
-        "nbf": datetime.datetime.now(tz=datetime.timezone.utc),
-        "exp": datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(seconds=30)
+        "jti": datetime.now(tz=timezone.utc).strftime('%Y%m%d%H%M%S%f'),
+        "nbf": datetime.now(tz=timezone.utc),
+        "exp": datetime.now(tz=timezone.utc) + timedelta(seconds=30)
     },
         private_key,
         "RS256",
@@ -118,50 +119,69 @@ def get_access_token_headers():
 def headers():
     return
 
-def getModel():
+def get_openai_parameters(model_name):
     access_token = get_access_token()
-    print(os.environ["AZURE_OPENAI_MODEL"])
-    return AzureChatOpenAI(
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        openai_api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-        deployment_name=os.environ["AZURE_OPENAI_MODEL"],
-        openai_api_key=os.environ["AZURE_OPENAI_API_KEY"],
-        openai_api_type="azure",
-        max_tokens=16384,
-        default_headers={
-            "Authorization": f"Bearer {access_token}",
-            "user_sid": "REPLACE"
+    common_params = {
+        "azure_endpoint": os.environ["AZURE_OPENAI_ENDPOINT"],
+        "openai_api_version": os.environ["AZURE_OPENAI_API_VERSION"],
+        "deployment_name": os.environ["AZURE_OPENAI_MODEL"],
+        "openai_api_key": os.environ["AZURE_OPENAI_API_KEY"],
+        "openai_api_type": "azure",
+        "default_headers": { "Authorization": f"Bearer {access_token}", "user_sid": "REPLACE" }
+    }
+
+    if any(substring in model_name for substring in ["o1-mini", "o3-mini"]):
+        specific_params = {
+            "temperature": 1,
+            "max_completion_tokens": 100000
         }
-    )
+    elif any(substring in model_name for substring in ["gpt-4o"]):
+        specific_params = {
+            "temperature": 0,
+            "max_tokens": 16384
+        }
+    else:
+        print("Unknown model:", model_name, "; using default parameters.")
+        specific_params = {
+            "temperature": 0,
+            "max_tokens": 16384
+        }
 
+    return {**common_params, **specific_params}
 
+def getModel():
+    model_name = os.environ["AZURE_OPENAI_MODEL"]
+    print("Loading LLM model:", os.environ["AZURE_OPENAI_MODEL"])
+    model_params = get_openai_parameters(model_name)
+    print(f"Loaded optimized model params: Temperature: {model_params['temperature']}, Max tokens: {model_params['max_tokens'] if 'max_tokens' in model_params else model_params['max_completion_tokens']}")
 
+    return AzureChatOpenAI(**model_params)
 
 if __name__ == "__main__":
-    print(get_access_token())
+    get_access_token()
     model = getModel()
 
     # get base64 data from ./test.png
-    with open("./src/react_agent/test.png", "rb") as image_file:
-        image_data = image_file.read()
-        base64_data = base64.b64encode(image_data).decode('utf-8')
+    # with open("./src/react_agent/test.png", "rb") as image_file:
+    #   image_data = image_file.read()
+    #   base64_data = base64.b64encode(image_data).decode('utf-8')
+    # 
+    # # save base64 to a txt file
+    # with open("./src/react_agent/base64.txt", "w") as text_file:
+    #   text_file.write(base64_data)
 
-        # save base64 to a txt file
-        with open("./src/react_agent/base64.txt", "w") as text_file:
-            text_file.write(base64_data)
+    result = model.invoke([
+        HumanMessage(content=[
+            {"type": "text", "text": "What is the React JavaScript framework?"},
 
+            # {
+            #    "type": "image_url",
+            #    "image_url": {
+            #        "url": f"data:image/png;base64,{base64_data}",
+            #        "detail": "high"
+            #    }
+            # }
+        ]),
+    ])
 
-    # result = model.invoke([
-    #     HumanMessage(content=[
-    #         {"type": "text", "text": "Describe this image in one sentence:"},
-    #         {
-    #             "type": "image_url",
-    #             "image_url": {
-    #                 "url": f"data:image/png;base64,{base64_data}",
-    #                 "detail": "high"
-    #             }
-    #         }
-    #     ]),
-    # ])
-
-    # print(result.content)
+    print(result.content)

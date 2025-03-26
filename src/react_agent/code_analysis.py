@@ -1,7 +1,6 @@
 """
 Code analysis module to extract requirements and convert BlueJS applications to React.
 """
-
 import os
 import subprocess
 import shutil
@@ -9,12 +8,15 @@ from typing import Dict, List, Tuple, Optional, Any, Set
 import re
 from pathlib import Path
 import json
+import rapidjson # faster is better (also it handles poorly-formatted JSON)
 import time
 import logging
 import hashlib
+import glob
 
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.prompts import PromptTemplate
+from langchain_community.callbacks import get_openai_callback
 from pydantic import BaseModel, Field
 from react_agent.ChaseAzureOpenAI import getModel
 from langchain.memory import ConversationBufferMemory
@@ -31,11 +33,20 @@ logger = logging.getLogger(__name__)
 # Define a dedicated location for storing repositories
 REPO_STORAGE_DIR = os.path.join(os.path.expanduser("~"), ".react_agent", "repositories")
 
+# Resolved path cache
+RESOLVED_PATH_CACHE = {}
+
+# Paths that cannot be resolved
+UNRESOLVABLE_PATHS = set()
+
+# Misc metrics
+GENERATED_FILE_COUNT = 0
+
 class CodeAnalyzer:
     """Analyzes BlueJS code repositories to extract requirements and convert to React."""
     
     def __init__(self, model_name: str = "gpt-4o", timeout_minutes: int = 30):
-        """Initialize with the specified LLM model."""
+        """Initialize with the specified model."""
         self.llm = getModel()
         # Add memory to track the conversation with the LLM
         self.memory = ConversationBufferMemory(return_messages=True)
@@ -50,78 +61,6 @@ class CodeAnalyzer:
         self.start_time = None
         # For caching large responses
         self.analysis_cache = {}
-    
-    def analyze_repo(self, repo_url: str, screen_id: str) -> Dict[str, Any]:
-        """
-        Main entry point to analyze a repository based on a screen ID.
-        
-        Args:
-            repo_url: URL of the git repository to clone and analyze
-            screen_id: Path-like string in format "<app_name>/<area_name>/<controller_file_name>/<action>"
-            
-        Returns:
-            Dictionary containing analysis results, requirements and converted React components
-        """
-        self.start_time = time.time()
-        logger.info(f"Starting analysis of {repo_url} for screen {screen_id}")
-        
-        # Parse the screen ID
-        app_name, area_name, controller_name, action = self._parse_screen_id(screen_id)
-        if action == "":
-            action = "index"  # Default action
-            
-        logger.info(f"Parsed screen ID: App={app_name}, Area={area_name}, Controller={controller_name}, Action={action}")
-        
-        # Ensure the repository storage directory exists
-        os.makedirs(REPO_STORAGE_DIR, exist_ok=True)
-        
-        # Clone the repository to our dedicated storage location
-        repo_path = self._clone_repo(repo_url, REPO_STORAGE_DIR)
-        
-        # Generate file tree
-        file_tree = self._build_file_tree(repo_path)
-        logger.info("Generated file tree structure")
-        
-        # Find and parse configuration files for path aliases
-        self._parse_config_files(repo_path)
-        logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
-        
-        # Find controller file using LLM
-        controller_file = self._find_controller_file_with_llm(repo_path, screen_id)
-        if not controller_file:
-            # Fall back to heuristic-based search
-            logger.info("LLM-based controller file search failed, falling back to heuristic search")
-            controller_file = self._find_controller_file_with_heuristic(repo_path, screen_id)
-        
-        if not controller_file:
-            raise ValueError(f"Could not find controller file for {controller_name}")
-        
-        logger.info(f"Found controller file: {controller_file}")
-        
-        # Analyze the controller file and its dependencies
-        controller_analysis = self._analyze_file_dependencies(controller_file, repo_path)
-        
-        # Analyze code to generate requirements with dependency context
-        requirements = self._generate_requirements_with_context(
-            repo_path, 
-            controller_file,
-            file_tree,
-            controller_analysis
-        )
-        
-        elapsed_time = time.time() - self.start_time
-        logger.info(f"Analysis completed in {elapsed_time:.2f} seconds")
-        
-        return {
-            "screen_id": screen_id,
-            "file_tree": file_tree,
-            "controller_file": str(controller_file),
-            "action_function": action,
-            "requirements": requirements,
-            "dependencies": self.dependency_graph,
-            "path_aliases": self.alias_map,
-            "analysis_time_seconds": elapsed_time
-        }
             
     def _parse_screen_id(self, screen_id: str) -> Tuple[str, str, str, str]:
         """Parse the screen ID into its components."""
@@ -212,7 +151,7 @@ class CodeAnalyzer:
         
         # File extensions to include (focus on JavaScript/TypeScript files and configs)
         included_extensions = {
-            '.js', '.jsx', '.ts', '.tsx', '.json', '.html', '.css', '.scss', '.less',
+            '.js', '.jsx', '.ts', '.tsx', '.json', '.html',
             '.config.js', '.config.ts'
         }
         
@@ -281,6 +220,151 @@ class CodeAnalyzer:
         
         return "\n".join(result)
     
+    def _find_manifest_and_registry_files(self, repo_path: str) -> List[str]:
+        """
+        Finds manifest.js and registry.js files in the provided folder.
+        """
+
+        # Search for files named "manifest.js" or "registry.js" under the given directory
+        search_patterns = ["**/src/**/manifest.js", "**/src/**/registry.js"]
+        found_files = []
+
+        for pattern in search_patterns:
+            found_files.extend(glob.glob(os.path.join(repo_path, pattern), recursive=True))
+    
+        return found_files
+
+    def _remove_comments(self, js_code: str) -> str:
+        """
+        Removes comments from a JavaScript code string.
+
+        Args:
+            js_code: The JavaScript code string to remove comments from.
+
+        Returns:
+            The JavaScript code string with comments removed.
+        """
+        # Remove single-line comments
+        js_code = re.sub(r'//.*', '', js_code)
+        # Remove multi-line comments
+        js_code = re.sub(r'/\*[\s\S]*?\*/', '', js_code)
+        return js_code
+
+    def _extract_json_from_javascript(self, file_path: str) -> Dict[str, Any]:
+        """
+        Converts a simple JavaScript AMD module to JSON.
+
+        Args:
+            file_path: The path to the JavaScript file.
+            
+        Returns:
+            A Dictionary representation of the module, or None if conversion fails.
+        """
+
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            js_code = f.read()
+
+        # Attempt to locate just the JSON portion of the file, navigating around the
+        # "define({ ... })" of an AMD module.
+        match = re.search(r"define\(\s*.*?,\s*function\s*\(\)\s*\{(.*)\}\s*\)", js_code, re.DOTALL)
+        if not match:
+            match = re.search(r"define\(\s*({.*?})\s*\)", js_code, re.DOTALL)
+        if match:
+            try:
+                module_content = match.group(1).strip()
+
+                # Add double quotes around keys. Do this globally, to the entire module_content string.
+                module_content = re.sub(r'(\w+):', r'"\1":', module_content)
+                
+                # Wrap boolean values with double quotes
+                module_content = re.sub(r'\btrue\b', '"true"', module_content)
+                module_content = re.sub(r'\bfalse\b', '"false"', module_content)
+
+                # Convert single quotes to double quotes
+                module_content = re.sub(r"'", '"', module_content)
+                
+                # Remove JavaScript comments, which are invalid in JSON files.
+                module_content = self._remove_comments(module_content)
+
+                # Return a dictionary representation of the module, or None if conversion fails.
+                return rapidjson.loads(module_content,
+                                       parse_mode=rapidjson.PM_COMMENTS | rapidjson.PM_TRAILING_COMMAS)
+
+            except Exception as e:
+                print(f"Error converting " + file_path + " to JSON: " + str(e))
+                print(f"Here is the offending JSON: " + module_content)
+                return None
+        else:
+            print("No AMD module definition found.")
+            return None
+
+    def _load_json_maps_from_files(self, repo_path: str) -> Dict[str, Any]:
+        """
+        Loads JSON maps from files in the given directory.
+        """
+        files = self._find_manifest_and_registry_files(repo_path)
+        json_maps = {}
+
+        for file in files:
+            json_map = self._extract_json_from_javascript(file)
+            if json_map:
+                json_maps[file] = json_map
+        
+        return json_maps
+
+    def _build_controller_to_component_map(self, repo_path: str) -> Dict[str, Set[str]]:
+        """ 
+        Builds a Dictionary mapping controllers to components. 
+        """
+        logger.info(f"Locating manifest and registry files in {repo_path}.")
+        try:
+            registry_maps = self._load_json_maps_from_files(repo_path)
+        except Exception as e:
+            print(f"Error building controller to component map: {e}")
+            return None
+
+        controllers_with_components = {}
+            
+        # Create a Dictionary mapping controllers to a Set of components.
+        def get_controllers_with_components(registry_map: Dict[str, Any]) -> Dict[str, Set[str]]:
+            """
+            Given a map holding registry data, return a Dictionary mapping controllers to a Set of components.
+            """            
+            area_data = registry_map["area"]
+            if "controllers" in area_data:
+                controller_data = area_data["controllers"]
+                for controller_name, controller_data in controller_data.items():
+                    if "components" in controller_data:
+                        for component_name, component_data in controller_data["components"].items():
+                            if controller_name not in controllers_with_components:
+                                controllers_with_components[controller_name] = set()
+                            controllers_with_components[controller_name].add(component_name)
+
+        for registry_map in registry_maps:
+            controller_map = get_controllers_with_components(registry_maps[registry_map])
+            
+            # It's possible controller_map is empty, as some manifest/registry files do not include controller information.
+            if controller_map is not None:
+                controllers_with_components.update(controller_map)
+        
+        logger.info(f"Collected {len(controllers_with_components)} controllers with components.")
+        return controllers_with_components
+
+    def _build_component_to_controller_map(self, controller_to_component_map):
+        """
+        Utility function to invert the controller-to-component map,
+        producing a component-to-controller map.
+        """
+        if controller_to_component_map is None:
+            return None
+        
+        component_to_controller_map = {}
+        for controller, components in controller_to_component_map.items():
+            for component in components:
+                component_to_controller_map[component] = controller
+        return component_to_controller_map
+
+
     def _find_controller_file_with_llm(self, repo_path: str, screen_id: str) -> Optional[Path]:
         """
         Use LLM to find the controller file in the repository based on the screen ID.
@@ -589,7 +673,6 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         logger.warning(f"Could not find controller file for {screen_id} with heuristic")
         return None
 
-    
     def _find_templates(self, repo_path: str, action_code: str, controller_file: Path, action_details: Dict[str, Any]) -> List[Dict[str, str]]:
         """Find templates referenced in the action code and related files."""
         # Start with templates directly referenced in action
@@ -804,7 +887,7 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
     def _parse_config_files(self, repo_path: str) -> None:
         """Parse configuration files to extract path aliases."""
         logger.info("Searching for configuration files with path aliases")
-        
+
         # Common config file patterns to search for
         config_patterns = [
             # Webpack config files
@@ -816,18 +899,19 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             # Package.json with potential aliases
             '**/package.json',
             # Common BlueJS config patterns (based on what we've seen)
-            '**/app.config.js', '**/app.paths.js', '**/paths.js', '**/aliases.js',
+            '**/app.config.js', '**/app.paths.js', '**/paths.js', '**/aliases.js', "**/registery.js", "**/main.js"
         ]
-        
+
         # Track found config files
         found_config_files = []
-        
+
         # Search for config files using patterns
         for pattern in config_patterns:
-            for config_path in Path(repo_path).glob(pattern):
-                if config_path.is_file():
-                    found_config_files.append(config_path)
-        
+            for config_path in glob.glob(str(Path(repo_path) / pattern), recursive=True):
+                logger.info(f"Checking file: {config_path}")
+                if Path(config_path).is_file():
+                    found_config_files.append(Path(config_path))
+
         logger.info(f"Found {len(found_config_files)} potential configuration files")
         
         # Also look for require.config or define calls in any JS file since BlueJS might define aliases anywhere
@@ -1213,13 +1297,21 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
     
     def _resolve_dependency_path(self, dependency: str, current_file: Path, repo_path: str) -> Optional[str]:
         """Resolve a dependency string to an actual file path."""
+
+        # Check if we've already deemed this un-resolvable
+        if dependency in UNRESOLVABLE_PATHS:
+            return None
+
         # Check if this is an aliased path
+        logger.info(f"Resolving dependency: {dependency} in repo {repo_path}")
+
+        # logger.info(f"Resolving dependency: {dependency}")
         for alias, alias_path in self.alias_map.items():
             if dependency.startswith(alias):
                 # Replace alias with actual path
                 relative_path = dependency[len(alias):].lstrip('/')
                 # Try different extensions
-                for ext in ['.js', '.jsx', '.ts', '.tsx']:
+                for ext in ['.js', '.jsx', '.ts', '.tsx', '.json', '.html', '.css', '.scss', '.less']:
                     full_path = os.path.normpath(os.path.join(alias_path, relative_path + ext))
                     if os.path.exists(full_path):
                         return full_path
@@ -1227,26 +1319,23 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
                 # Check for index files in directory
                 dir_path = os.path.join(alias_path, relative_path)
                 if os.path.isdir(dir_path):
-                    for index_file in ['index.js', 'index.jsx', 'index.ts', 'index.tsx']:
+                    for index_file in ['index.js', 'index.jsx', 'index.ts', 'index.tsx', 'index.json', 'index.html', 'index.css', 'index.scss', 'index.less']:
                         full_path = os.path.join(dir_path, index_file)
                         if os.path.exists(full_path):
                             return full_path
-                
-                # Default to .js if nothing else found
-                return os.path.join(alias_path, relative_path) + '.js'
                 
         # Relative path from current file
         if dependency.startswith('./') or dependency.startswith('../'):
             base_path = os.path.normpath(os.path.join(os.path.dirname(current_file), dependency))
             
             # Try different extensions
-            for ext in ['.js', '.jsx', '.ts', '.tsx']:
+            for ext in ['.js', '.jsx', '.ts', '.tsx', '.json', '.html', '.css', '.scss', '.less']:
                 if os.path.exists(base_path + ext):
                     return base_path + ext
             
             # Check for index files in directory
             if os.path.isdir(base_path):
-                for index_file in ['index.js', 'index.jsx', 'index.ts', 'index.tsx']:
+                for index_file in ['index.js', 'index.jsx', 'index.ts', 'index.tsx', 'index.json', 'index.html', 'index.css', 'index.scss', 'index.less']:
                     full_path = os.path.join(base_path, index_file)
                     if os.path.exists(full_path):
                         return full_path
@@ -1266,103 +1355,97 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         # Try different extensions and index files
         for base_path in common_paths:
             # Try with extensions
-            for ext in ['.js', '.jsx', '.ts', '.tsx']:
+            for ext in ['.js', '.jsx', '.ts', '.tsx', '.json', '.html', '.css', '.scss', '.less']:
+                # logger.info(f"Trying path: {base_path + ext}") # DEBUG
                 if os.path.exists(base_path + ext):
                     return base_path + ext
             
             # Try index files
             if os.path.isdir(base_path):
-                for index_file in ['index.js', 'index.jsx', 'index.ts', 'index.tsx']:
+                for index_file in ['index.js', 'index.jsx', 'index.ts', 'index.tsx', 'index.json', 'index.html', 'index.css', 'index.scss', 'index.less']:
                     full_path = os.path.join(base_path, index_file)
                     if os.path.exists(full_path):
                         return full_path
         
         logger.warning(f"Could not resolve dependency path: {dependency}")
+        # Add this dependency to the UNRESOLVABLE_PATHS set.
+        UNRESOLVABLE_PATHS.add(dependency)
         return None
-            
-    def _generate_requirements_with_context(
-        self, 
-        repo_path: str, 
-        controller_file: Path,
-        file_tree: str,
-        controller_analysis: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Generate requirements with comprehensive context from dependency analysis."""
+
+    def find_defined_controller_files(self, controller_names: List[str], repo_path: str) -> List[Path]:
+        """
+        Find all controller files in the repository that match the given keys.
         
-        # Read the controller file
-        with open(controller_file, 'r', encoding='utf-8', errors='ignore') as f:
-            controller_content = f.read()
+        Args:
+            controller_names: List of controller names to find in filesystem
+            repo_path: Path to the repository root
             
-        # Prepare dependency information
-        dependency_info = json.dumps(self.dependency_graph, indent=2)
+        Returns:
+            List of paths to controller files
+        """
+        logger.info(f"Finding all controller files in {repo_path}")
+        controller_dir_names = ['controller', 'controllers']
+        controller_files = []
+        discovered_controller_names = []
+        unexpected_controller_names = []
+
+        matched_controller_files = [] # List of controllers that matched provided controller_names list
         
-        # Get conversation history from memory
-        conversation_history = self.memory.load_memory_variables({})
-        analysis_context = conversation_history.get("history", "No previous analysis available.")
-        
-        # Find config files for path aliases
-        config_files = []
-        for alias, path in self.alias_map.items():
-            config_files.append({
-                "alias": alias,
-                "path": path
-            })
-        
-        requirements_prompt = PromptTemplate.from_template(
-            """You are examining code from a JavaScript application that uses a custom framework called BlueJS. 
-            Please analyze the code patterns and structure to help translate this application to React.
+        # Walk through the repository to find controller directory
+        for root, dirs, files in os.walk(repo_path):
+            # Skip certain directories that won't contain views
+            dirs[:] = [d for d in dirs if d.lower() not in [
+                'node_modules', '.git', 'test', 'tests', '__tests__', 
+                'spec', 'specs', 'e2e', 'dist', 'build'
+            ]]
             
-            File tree:
-            ```
-            {file_tree}
-            ```
+            # Check if current directory is a controller directory
+            current_dir = os.path.basename(root).lower()
+            is_controller_dir = current_dir in controller_dir_names
             
-            Controller file: {controller_file}
-            ```javascript
-            {controller_content}
-            ```
+            # Also check if any parent directory in the path is a controller directory
+            path_parts = Path(root).relative_to(repo_path).parts
+            has_controller_parent = any(part.lower() in controller_dir_names for part in path_parts)
             
-            Dependency Analysis:
-            {dependency_analysis}
-            
-            Previous file analysis:
-            {analysis_context}
-            
-            Path aliases:
-            {config_info}
-            
-            Based solely on the code patterns you observe (not on prior knowledge of BlueJS), create a requirements document with these sections:
-            1. Application Overview - What appears to be the purpose of this application based on the code?
-            2. Data Flow and State Management - How does the application manage data? What state management would be needed in React?
-            3. UI Components - What UI components will need to be created in React based on the templates?
-            4. API Integrations - What external services or APIs does the application interact with?
-            5. Routing Structure - How does routing appear to work in this application? What pages/urls exist?
-            6. React Implementation Approach - How would you recommend implementing this in React?
-            
-            Focus on concrete patterns you observe in the code without making assumptions about how BlueJS works internally.
-            The requirements should be detailed enough to completely re-write the application without loss of functionality.
-            """
-        )
-        
-        config_info = "\n".join([
-            f"- {c['alias']} -> {c['path']}"
-            for c in config_files
-        ]) if config_files else "No path aliases found."
-        
-        message_content = requirements_prompt.format(
-            file_tree=file_tree,
-            controller_file=str(controller_file),
-            controller_content=controller_content,
-            dependency_analysis=json.dumps(controller_analysis, indent=2),
-            analysis_context=analysis_context,
-            config_info=config_info
-        )
-        
-        requirements = self.llm.invoke([HumanMessage(content=message_content)]).content
-        
-        return {
-            "full_requirements": requirements
-        }
+            if is_controller_dir or has_controller_parent:
+                # Add all JavaScript/TypeScript files in this directory
+                for file in files:
+                    if file.endswith(('.js', '.ts', '.jsx', '.tsx')):
+                        # Get just the prefix of the file
+                        file_prefix = file[:file.rindex('.')]
+                        if file_prefix not in controller_names:
+                            logger.info(f"Unexpected controller name: {file_prefix}")
+                            unexpected_controller_names.append(file_prefix)
+                        discovered_controller_names.append(file_prefix)
+                        
+                        # if file_prefix is in controller_names, add it to the matched_controller_files list
+                        if file_prefix in controller_names:
+                            matched_controller_files.append(file_prefix)
+
+                        controller_file_path = Path(os.path.join(root, file))
+                        controller_files.append(controller_file_path)
+                        logger.info(f"Found controller file: {controller_file_path}")
+    
+        logger.info(f"Found {len(controller_files)} controller files in total")
+
+        # For each name in controller_names, check to see if it exists in matched_controller_files
+        all_expected_controllers_found = True
+        extra_controllers_found = False
+        for name in controller_names:
+            if not name in discovered_controller_names:
+                logger.info(f"Controller {name}, listed in this project's registry, was not found in filesystem.")
+                all_controllers_found = False
+        for name in discovered_controller_names:
+            if not name in controller_names:
+                logger.info(f"Controller {name} was found in filesystem, but was not listed in this project's registry.")
+                extra_controllers_found = True
+
+        logger.info(f"Expected to find {len(controller_names)} controller files: {controller_names}. Found: {len(matched_controller_files)}: {matched_controller_files}")
+        if (all_expected_controllers_found):
+            logger.info("All expected controllers were found in the filesystem.")
+        if (extra_controllers_found):
+            logger.info("Extra controllers beyond those listed in the registry were found in the filesystem.")
+        return controller_files
 
     def find_all_view_files(self, repo_path: str) -> List[Path]:
         """
@@ -1418,12 +1501,24 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         """
         logger.info(f"Analyzing dependencies for view file: {view_file}")
         dependencies = set()
-        dependencies.add(view_file)  # Include the original view file
-        
         # Reset visited files for this analysis
         self.visited_files = set()
+        # Include the original view file
+        dependencies.add(view_file)
         
-        # Start recursive dependency analysis
+        
+
+        # add BlueJS component and its dependencies as a dependency
+        path_parts = list(view_file.parts)
+        adjacent_dir_idx = path_parts.index('views')
+        path_parts[adjacent_dir_idx] = 'components'
+        component_file = Path(os.sep.join(path_parts))
+        if os.path.exists(component_file):
+            dependencies.add(Path(component_file))
+            logger.info(f"Added component {component_file} to dependencies")
+            self._analyze_file_dependencies_recursive(component_file, repo_path, dependencies)
+
+        # Start recursive dependency analysis for the view script
         self._analyze_file_dependencies_recursive(view_file, repo_path, dependencies)
         
         logger.info(f"Found {len(dependencies)} dependencies for {view_file}")
@@ -1462,13 +1557,12 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
             for pattern in import_patterns:
                 for match in re.finditer(pattern, content):
                     imported_path = match.group(1)
-
-                    logger.info(f"Found Dependency: {imported_path}")
                     
                     # Resolve relative imports
-                    full_path = self._resolve_import_path(imported_path, file_path, repo_path)
-                    if full_path and full_path.exists():
-                        logger.debug(f"Found dependency: {full_path}")
+                    full_path = self._resolve_dependency_path(imported_path, file_path, repo_path)
+                    # logger.info(f"Found dependency: {full_path}")
+                    if full_path and Path(full_path).exists():
+                        # logger.info(f"Added dependency: {full_path}")
                         dependencies.add(full_path)
                         
                         # Recursively analyze this dependency
@@ -1476,34 +1570,6 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         
         except Exception as e:
             logger.error(f"Error analyzing dependencies for {file_path}: {str(e)}")
-
-    def _resolve_import_path(self, import_path: str, current_file: Path, repo_path: str) -> Optional[Path]:
-        """
-        Resolve an import path to an absolute file path.
-        
-        Args:
-            import_path: The import path from the source code
-            current_file: The file containing the import
-            repo_path: Path to the repository root
-            
-        Returns:
-            Resolved absolute file path or None if not found
-        """
-        # Handle alias paths first (e.g., @app/component)
-        if import_path.startswith('@') and '/' in import_path:
-            for alias, alias_path in self.alias_map.items():
-                if import_path.startswith(alias):
-                    relative_path = import_path[len(alias):].lstrip('/')
-                    return Path(os.path.join(repo_path, alias_path, relative_path))
-        
-        # Handle relative paths
-        if import_path.startswith('./') or import_path.startswith('../'):
-            base_dir = current_file.parent
-            relative_path = os.path.normpath(os.path.join(base_dir, import_path))
-            return Path(relative_path)
-        
-        # Handle absolute paths relative to repo root
-        return Path(os.path.join(repo_path, import_path))
 
     def _convert_to_react(self, view_file: Path, dependent_files_content: Dict[str, str]) -> Dict[str, Any]:
         """
@@ -1535,16 +1601,32 @@ Don't give up! Controllers can be deeply nested or named in unexpected ways.
         
         # Prepare the context for the LLM
         system_prompt = """You are an expert at converting legacy web applications to modern React TypeScript applications.
-Your task is to convert view files and their dependencies to React components.
+Your task is to convert view files and their dependencies to React components. CONVERT EVERYTHING! DON'T LEAVE GAPS OR PLACEHOLDERS!
+Your job is to complete the conversion. Developers will not finish your job for you.
+
+DO NOT DO THINGS LIKE THIS (You should actually write the complete code):
+  return (
+    <div>
+      {/* Render template and partials */}
+      {/* Example: <StepOne {...viewContext} /> */}
+    </div>
+  );
+
+ACTUALLY CONVERT THE TEMPLATES TO REACT COMPONENTS!
 
 Guidelines:
-- Convert view context variables to props
-- Convert model data to state
+- Convert "context" variables to props
+- Convert "model" data to state
+- The react components should take individual props, not just a single 'model' object. 
 - Convert templates to React JSX components
 - For unrecognized web components, import them from '@mds/react' with PascalCase names
 - Props for MDS React components should be camelCase
 - Return a structured collection of files that together implement the view in React
-- Mark the main component file as the entrypoint
+- Use the MAIN VIEW FILE as the entrypoint
+- if templates are large, you may split them into their own granular files.
+- For DEPENDENCIES that include "components" in their file path, treat them as utilties and event handlers for the MAIN VIEW FILE. "Components" in the legacy code are NOT the same as React components.
+- remove any jQuery or DOM manipulation and use React best practices instead.
+- if a template uses the sanitizeHtml function, you can import it like this: `import sanitizeHtml from 'sanitize-html';`
 
 Organize files in the following folder structure:
 - components/: Place all React components here (the entrypoint should be directly in this folder)
@@ -1553,9 +1635,51 @@ Organize files in the following folder structure:
 - settings/: Place configuration, constants, and default values here
 
 For imports:
-- Convert require('@octagon/...') to ES6 import statements
-- Keep external library imports (both @octagon and npm packages)
+- Convert octagon imports like require('@octagon/<package_name>/*') to ES6 import statements (Shouldn't need to import from dist folders now since the new file will use ES6 imports)
+- retain external library imports like 'common/lib'. Keep the imports in place, but add a TODO for the dev to revisit those.
+- Whenever you see the 'blue/root' library being used, this is just the window object. So instead of using the root object, use window.
+- if you do use the window object, make sure it is compatible with server side rendering by checking if it is defined before using it.
 - Use relative imports for your own files
+- For imports of TypeScript types, specify 'type' explicitly to comply with 'verbatimModuleSyntax'.  For example: "import type { ViewContextType } from '../types/viewContext';"
+
+Example of MDS conversion:
+<mds-text-input 
+    name="totalMonthlyPayments"
+    id="totalMonthlyPayments"
+    fieldName="totalMonthlyPayments"
+    on-blur="validateAndFormat"
+    label={{~/totalMonthlyPaymentsLabel}}
+    placeholder={{~/amountPlaceholder}}
+    on-change="formFieldTracking"
+    validate="['required', 'noSpecialCharacters', 'currency', 'positiveNumber', 'noDecimals', 'lessThanOrEqualToMaxNumber', 'greaterThanOrEqualToMinNumber']"
+    validate-max="{{.maximumInputAmount}}"
+    validate-min="{{.minimumInputAmount}}"
+    error-key="affordabilityCalculatorQuestionErrorHeader"
+    name="totalMonthlyPayments"
+    microcopy="{{~/totalMonthlyPaymentsAdvisory}}"
+    value="{{sanitize.sanitizeHtml(~/totalMonthlyPayments)}}"
+>
+</mds-text-input>
+
+Becomes:
+import { MdsTextInput } from '@mds/react';
+import sanitizeHtml from 'sanitize-html';
+
+<MdsTextInput
+    name="totalMonthlyPayments"
+    id="totalMonthlyPayments"
+    fieldName="totalMonthlyPayments"
+    onBlur={validateAndFormat}
+    label={totalMonthlyPaymentsLabel}
+    placeholder={amountPlaceholder}
+    onChange={formFieldTracking}
+    validate={['required', 'noSpecialCharacters', 'currency', 'positiveNumber', 'noDecimals', 'lessThanOrEqualToMaxNumber', 'greaterThanOrEqualToMinNumber']}
+    validateMax={maximumInputAmount}
+    validateMin={minimumInputAmount}
+    errorKey="affordabilityCalculatorQuestionErrorHeader"
+    microcopy={totalMonthlyPaymentsAdvisory}
+    value={sanitizeHtml(totalMonthlyPayments)}
+/>
 """
         
         # Find the relative view path
@@ -1568,7 +1692,7 @@ For imports:
             # Fallback if we can't determine the relative path
             relative_view_path = os.path.basename(view_file)
         
-        user_prompt = f"""Here are the files involved in this view that need to be converted to React:
+        user_prompt = f"""Here are the files that need to be converted to React. You MUST convert everything. Do NOT leave gaps or placeholders.
 
 MAIN VIEW FILE:
 File: {os.path.basename(view_file)}
@@ -1589,13 +1713,24 @@ DEPENDENCIES:
         # Call LLM to convert to React with structured output
         try:
             from langchain_core.messages import SystemMessage, HumanMessage
-            
+
             messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ]
+
+            response = None
             
-            response = structured_llm.invoke(messages)
+            with get_openai_callback() as cb:
+
+                # Approximate the size of the messages in tokens by counting every 4 characters
+                messages_size = sum(len(message.content) for message in messages)
+                messages_size = int(messages_size / 4)
+
+                logger.info("Calling LLM (messages size ~" + str(messages_size) + " tokens)")
+                response = structured_llm.invoke(messages)
+                logger.info(f"Prompt Tokens: {cb.prompt_tokens}")
+                logger.info(f"Completion Tokens: {cb.completion_tokens}")
             
             # Convert the structured output to our standard format
             result = {
@@ -1673,32 +1808,110 @@ DEPENDENCIES:
         
         # Clone the repository to our dedicated storage location
         repo_path = self._clone_repo(repo_url, REPO_STORAGE_DIR)
+
+        # Load any registry files (registry.js, manifest.js) and map controllers to components.
+        controller_to_component_map = self._build_controller_to_component_map(repo_path)
+
+        # From controller_to_component_map, create a reciprocal component_to_controller map.
+        component_to_controller_map = self._build_component_to_controller_map(controller_to_component_map)
         
+        # Find identified controller files
+        # controller_files = self.find_defined_controller_files(controller_keys, repo_path)
+
         # Find all view files
         view_files = self.find_all_view_files(repo_path)
-        
+
         # Parse configuration files for path aliases
         self._parse_config_files(repo_path)
         logger.info(f"Parsed configuration files for path aliases. Found {len(self.alias_map)} aliases.")
         
         # Create output directory for React components
         timestamp = time.strftime("%Y%m%d-%H%M%S")
+        subdir_name =repo_url.split("/")[-1].removesuffix(".git")
         output_base_dir = Path(f"converted_views_{timestamp}")
+        code_base_dir = output_base_dir.joinpath(subdir_name)
+        output_base_dir = Path(f"converted_controllers_{timestamp}")
         os.makedirs(output_base_dir, exist_ok=True)
+
+        create_octagon_result = subprocess.run(
+            [
+                "npx", 
+                "--yes",
+                "@octagon/create-octagon-app@latest",
+                "react-app",
+                "--contentManagement=none",
+                "--deploymentTarget=none",
+                "--formManagement=react-hook-form",
+                "--microFrontendRender=none",
+                "--microFrontends=single-spa",
+                f"--name={output_base_dir}",
+                "--projectType=standalone",
+                "--reporting=none",
+                "--services=react-query",
+                "--styling=sass",
+                "--ui=mds",
+                "--uiTesting=none",
+                "--uiVariation=none",
+                "--utilities=none",
+                "--video=none",
+              ],
+            check=True,
+            capture_output=True,
+        )
+        if create_octagon_result.returncode != 0:
+            logger.error(f"Error creating Octagon shell: {create_octagon_result.stderr.decode('utf-8')}")
+            return {"error": create_octagon_result.stderr.decode('utf-8')}
         
+        logger.info("Adding common dependencies ...")
+        # add common dependencies
+        add_cxo_common_result = subprocess.run(
+            [
+                "npm",
+                "add",
+                "@seur/cxo-ui-common-utilities",
+                "@seur/cxo-common-assets",
+                "@mds/react",
+                "d3"
+            ],
+            cwd=Path.cwd().joinpath(output_base_dir),
+            check=True,
+            capture_output=True,
+        )
+
+        if add_cxo_common_result.returncode != 0:
+            logger.error(f"Error adding cxo common: {add_cxo_common_result.stderr.decode('utf-8')}")
+            return {"error": add_cxo_common_result.stderr.decode('utf-8')}  
+        
+        if add_cxo_common_result.stdout:
+            logger.info(f"Added common dependencies: {add_cxo_common_result.stdout.decode('utf-8')}")
+
         # Process each view file
         conversion_results = {}
+        generated_file_count = 0
+        current_view_file_counter = 0
         for view_file in view_files:
             try:
                 logger.info(f"Processing view file: {view_file}")
-                
                 # Create a specific output directory for this view
                 view_name = os.path.splitext(os.path.basename(view_file))[0]
-                output_dir = output_base_dir / view_name
+                current_view_file_counter += 1
+                logger.info(f"Processing view file {current_view_file_counter}/{len(view_files)}: {view_file}")
+                view_name = os.path.splitext(os.path.basename(view_file))[0]
+                
+                # Find parent controller
+                parent_controller = "no_controller" # Assume the worst
+
+                if component_to_controller_map is not None:
+                    # But hope for the best
+                    parent_controller = component_to_controller_map[view_name] if view_name in component_to_controller_map else "no_controller"
+
+                # Create a specific output directory for this view
+                view_name = os.path.splitext(os.path.basename(view_file))[0]
+                output_dir = output_base_dir / parent_controller / view_name
                 
                 # Analyze dependencies for this view
                 dependencies = self.analyze_view_dependencies(view_file, repo_path)
-                
+
                 # Read all dependent files
                 dependent_files_content = {}
                 for dep_file in dependencies:
@@ -1716,6 +1929,7 @@ DEPENDENCIES:
                 # Save the React components
                 if "components" in react_components:
                     save_result = self.save_react_components(react_components["components"], output_dir)
+                    generated_file_count += save_result["file_count"]
                     react_components["save_result"] = save_result
                 
                 # Store results
@@ -1739,7 +1953,9 @@ DEPENDENCIES:
         return {
             "conversion_results": conversion_results,
             "view_count": len(view_files),
+            "generated_file_count": generated_file_count,
             "analysis_time_seconds": elapsed_time,
+            "controller_to_component_map": controller_to_component_map,
             "output_base_dir": str(output_base_dir)
         }
 
@@ -1756,6 +1972,7 @@ def convert_blueJS_repo(repo_url: str) -> Dict[str, Any]:
         Dictionary containing analysis results, requirements and converted React components
     """
     analyzer = CodeAnalyzer()
+
     return analyzer.convert_views_to_react(repo_url)
 
 
@@ -1778,5 +1995,6 @@ if __name__ == "__main__":
     
     # Run the analysis
     result = convert_blueJS_repo(repo_url)
-    print(result)
 
+    logger.info(f"Converted {result['view_count']} view(s) to {result['generated_file_count']} React components in {result['analysis_time_seconds']:.2f} seconds.")
+    logger.info(f"Wrote results to: {result['output_base_dir']}/")
